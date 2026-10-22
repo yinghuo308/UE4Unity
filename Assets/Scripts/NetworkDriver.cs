@@ -29,6 +29,7 @@ namespace UeNet
                         // Dictionary<uint, Dictionary<ushort, PropertyUpdateData>>();
         private double nextStateSyncTime;
         [SerializeField]private uint testDespawnObjectId=1;
+        [SerializeField]private uint testRpcObjectId=1;
         private readonly Dictionary<uint,ObjectReplicator> objectReplicators=new Dictionary<uint, ObjectReplicator>();
         [ContextMenu("测试服务器销毁")]
         public void DespawnTestObject()
@@ -37,6 +38,44 @@ namespace UeNet
         }
         void Awake()
         {
+            RpcRegistry.Register(1, (target, argsJson) =>
+            {
+                HitRpcArgs args;
+                try
+                {
+                    args=JsonUtility.FromJson<HitRpcArgs>(argsJson);
+                }
+                catch
+                {
+                    return ;
+                }
+                if(args==null)return;
+                Debug.Log(
+                $"收到受击 RPC：ObjectId={target.NetObjectId}, Damage={args.Damage}",
+                target);
+            });
+            RpcRegistry.Register(101, (target, argsJson) =>
+            {
+                HitRpcArgs args;
+                try
+                {
+                    args = JsonUtility.FromJson<HitRpcArgs>(argsJson);
+                }
+                catch (ArgumentException)
+                {
+                    return;
+                }
+                if (args == null || args.Damage <= 0 || args.Damage > 50)
+                    return;
+                // 该 handler 应只处理服务器上的权威对象。
+                if (!target.IsServerObject)
+                    return;
+                target.Health = Mathf.Max(0, target.Health - args.Damage);
+                Debug.Log(
+                    $"服务器处理请求：ObjectId={target.NetObjectId}, " +
+                    $"Health={target.Health}",
+                    target);
+            });
             Application.runInBackground=true;
         }
         // Start is called before the first frame update
@@ -102,7 +141,26 @@ namespace UeNet
                 // 4. 对方告诉我们：自己发出的哪些包已被收到。
                 connection.Packets.ProcessAck(
                     packet, now,acknowledgedSequences);
-                
+                ReliableReceiveBuffer receiver=connection.ReliableReceiver;
+                if (reliable && type == NetMessageType.ActorBunch)
+                {
+                    NetBunch bunch;
+                    try
+                    {
+                        bunch=JsonUtility.FromJson<NetBunch>(data);
+                    }
+                    catch
+                    {
+                        continue;
+                    }
+                    if(bunch==null||bunch.ObjectId==0)continue;
+                    if(!connection.ActorChannels.TryGetValue(bunch.ObjectId,out ActorChannel channel))
+                    {
+                        channel=new ActorChannel(bunch.ObjectId);
+                        connection.ActorChannels.Add(bunch.ObjectId,channel);
+                    }
+                    receiver = channel.ReliableReceiver;
+                }
                 for (int ackIndex = 0;
                     ackIndex < acknowledgedSequences.Count;
                     ackIndex++)
@@ -112,6 +170,10 @@ namespace UeNet
                     connection.ReliableMessageQueue
                         .AcknowledgePacket(
                             acknowledgedSequence);
+                    foreach(ActorChannel channel in connection.ActorChannels.Values)
+                    {
+                        channel.ReliableSender.AcknowledgePacket(acknowledgedSequence);
+                    }
                     int confirmedProperties=connection.Replication.AcknowledgePacket(acknowledgedSequence);
                     if (confirmedProperties > 0)
                     {
@@ -122,7 +184,23 @@ namespace UeNet
                             this);
                     }
                 }
-                if(reliable&&!connection.ReliableReceiver.CanAccept(messageId))continue;
+                var closingChannelsToRemove=new List<uint>();
+                foreach(var pair in connection.ActorChannels)
+                {
+                    if (pair.Value.State == ActorChannelState.Closing && pair.Value.ReliableSender.PendingCount == 0)
+                    {
+                        closingChannelsToRemove.Add(pair.Key);
+                    }
+                }
+                foreach(uint objectId in closingChannelsToRemove)
+                {
+                    if(connection.ActorChannels.TryGetValue(objectId,out ActorChannel channel))
+                    {
+                        channel.Close();
+                        connection.ActorChannels.Remove(objectId);
+                    }
+                }
+                if(reliable&&!receiver.CanAccept(messageId))continue;
 
                 // 5. 记录收到的编号，过滤重复包和过旧的包。
                 if (!connection.Packets.RecordReceived(packet.Sequence))
@@ -146,7 +224,7 @@ namespace UeNet
                     messageId,
                     data);
                 List<ReceivedReliableMessage> ready =
-                    connection.ReliableReceiver.Receive(
+                    receiver.Receive(
                         received);
                 // 10. 只执行当前已经连续到达的可靠消息。
                 foreach (ReceivedReliableMessage message in ready)
@@ -187,10 +265,6 @@ namespace UeNet
             if(type==NetMessageType.Heartbeat)
             {
                 existing.lastReceiveTime=Now;
-        //         Debug.Log(
-        // $"{name} 收到心跳：编号={connectionId}，" +
-        // $"来源={remote}，时间={Now:F2}",
-        // this);
             }
             else if (type == NetMessageType.ReliableTest)
             {
@@ -207,6 +281,10 @@ namespace UeNet
                 connections.Remove(remote);
                 Debug.Log(
                     $"客户端主动断开：{existing.connectionID}");
+            }
+            else if (type == NetMessageType.ActorBunch)
+            {
+                HandleActorBunch(existing,data);
             }
         }
         private void DispatchMessage(string remote,
@@ -485,7 +563,9 @@ namespace UeNet
                 if(existing.connectionState!=ConnectionState.Connected)return null;
                  // 当前服务端只处理这两种已连接消息。
                 if (type != NetMessageType.Heartbeat &&
-                    type != NetMessageType.DisConnect&&type!=NetMessageType.ReliableTest
+                    type != NetMessageType.DisConnect&&
+                    type!=NetMessageType.ReliableTest&&
+                    type!=NetMessageType.ActorBunch
                   )
                 return null;
                 return existing;
@@ -531,21 +611,38 @@ namespace UeNet
         private void FlushReliable(
             Connection connection)
         {
-            List<ReliableMessageQueue.OutboundMessage> due =
+             List<ReliableMessageQueue.OutboundMessage> due =
                 connection.ReliableMessageQueue.CollectDue(
                     Now,
                     RetryInterval,
                     8);
-
             foreach (
                 ReliableMessageQueue.OutboundMessage message
                 in due)
+                {
+                    SendPayload(connection,message.Payload,message.MessageId);
+                }
+            foreach(ActorChannel channel in connection.ActorChannels.Values)
             {
-                SendPayload(
-                    connection,
-                    message.Payload,
-                    message.MessageId);
+                List<ReliableMessageQueue.OutboundMessage> channelDue =
+                    channel.ReliableSender.CollectDue(
+                        Now,
+                        RetryInterval,
+                        8);
+                foreach (ReliableMessageQueue.OutboundMessage message
+                        in channelDue)
+                {
+                    uint packetSequence = SendPayload(
+                        connection,
+                        message.Payload,
+                        0);
+                    channel.ReliableSender.MarkSent(
+                        message.MessageId,
+                        packetSequence,
+                        Now);
+                }
             }
+            
         }
         private void FlushPropertyUpdates(Connection connection,double now)
         {
@@ -605,10 +702,10 @@ namespace UeNet
               Type=NetBunchType.Open,
               PayloadJson=JsonUtility.ToJson(spawnData)  
             };
-            QueueReliableBunch(connection,bunch);
             ActorChannel channel=new ActorChannel(objectId);
             channel.Bind(networkObject);
             connection.ActorChannels.Add(objectId,channel);
+            QueueReliableBunch(connection,bunch);
         }
         private void QueueInitialObjects(Connection connection)
         {
@@ -636,25 +733,80 @@ namespace UeNet
                 Debug.LogWarning("请在运行中的服务器上调用。", this);
                 return;
             }
-            GameObject instance=new GameObject("ServerNetworkObject");
-            NetworkObject networkObject =
-                instance.AddComponent<NetworkObject>();
-            networkObject.Health = 100;
-            networkObjectRegistry.RegisterServerObject(
-                networkObject);
-            objectReplicators.Add(networkObject.NetObjectId,new ObjectReplicator(networkObject));
+            var connectedClients = new List<Connection>();
             foreach (Connection connection in connections.Values)
+            {
+                if (connection.connectionState == ConnectionState.Connected)
+                    connectedClients.Add(connection);
+            }
+             if (connectedClients.Count == 0)
+            {
+                Debug.LogWarning("当前没有已连接的客户端。", this);
+                return;
+            }
+            foreach(Connection ownerConnection in connectedClients)
+            {
+                GameObject instance=new GameObject($"ServerPlayerObject_{ownerConnection.connectionID}");
+                NetworkObject networkObject=instance.AddComponent<NetworkObject>();
+                networkObject.Health=100;
+                networkObjectRegistry.RegisterServerObject(networkObject);
+                networkObject.OwnerConnectId=ownerConnection.connectionID;
+                objectReplicators.Add(networkObject.NetObjectId,new ObjectReplicator(networkObject));
+                foreach(Connection recipient in connectedClients)
                 {
-                    if (connection.connectionState !=
-                        ConnectionState.Connected)
-                    {
-                        continue;
-                    }
-                    SendSpawnObject(connection,networkObject);
+                    SendSpawnObject(recipient,networkObject);
                 }
+                 Debug.Log(
+                    $"服务器生成对象：ObjectId={networkObject.NetObjectId}, " +
+                    $"OwnerConnectionId={networkObject.OwnerConnectId}",
+                    instance);
+            }
+        }
+       [ContextMenu("测试发送受击 RPC")]
+        public void SendTestHitRpc()
+        {
+            if (!isServer)
+            {
+                Debug.LogWarning("请在服务器的 NetworkDriver 上运行此测试。", this);
+                return;
+            }
+            string argsJson = JsonUtility.ToJson(
+                new HitRpcArgs { Damage = 25 });
+            int queuedCount = 0;
+            foreach (Connection connection in connections.Values)
+            {
+                if (connection.connectionState != ConnectionState.Connected)
+                    continue;
+                if (!connection.ActorChannels.TryGetValue(
+                        testRpcObjectId,
+                        out ActorChannel channel) ||
+                    channel.State != ActorChannelState.Open)
+                {
+                    continue;
+                }
+                SendClientRpc(
+                    connection,
+                    testRpcObjectId,
+                    1,
+                    argsJson);
+                queuedCount++;
+            }
             Debug.Log(
-                $"服务器创建对象，ObjectId={networkObject.NetObjectId}",
-                instance);
+                $"已为 {queuedCount} 个客户端排入受击 RPC，对象编号={testRpcObjectId}",
+                this);
+        }
+        [ContextMenu("测试客户端请求服务器 RPC")]
+        public void TestServerRpc()
+        {
+            if (isServer) 
+            {
+                Debug.LogWarning("这个测试入口必须在客户端运行。", this);
+                return;
+            }
+            SendServerRpc(
+                testRpcObjectId,
+                101,
+                JsonUtility.ToJson(new HitRpcArgs { Damage = 10 }));
         }
         public bool DespawnServerObject(uint objectId)
         {
@@ -673,10 +825,11 @@ namespace UeNet
             {
                 if (connection.connectionState ==
                         ConnectionState.Connected &&
-                    connection.ReliableMessageQueue.PendingCount >= 256)
+                    connection.ActorChannels.TryGetValue(objectId,out ActorChannel channel)
+                            &&channel.ReliableSender.PendingCount >= 256)
                 {
                     Debug.LogWarning(
-                        "可靠队列已满，请稍后重试销毁。",
+                        "对象通道可靠队列已满",
                         this);
                     return false;
                 }
@@ -701,8 +854,7 @@ namespace UeNet
                     };
                     connection.Replication.RemoveObject(objectId);
                     QueueReliableBunch(connection,bunch);
-                    channel.Close();
-                    connection.ActorChannels.Remove(objectId);
+                    channel.BeginClose();
                 }
                 connection.Replication.RemoveObject(objectId);
             }
@@ -774,12 +926,12 @@ namespace UeNet
                     }
                     connection.Replication.Merge(update);
                 }
-                foreach(Connection connection in connections.Values)
-                {
-                    if(connection.connectionState!=ConnectionState.Connected)continue;
-                    FlushPropertyUpdates(connection,now);
-                }
             }
+            foreach(Connection connection in connections.Values)
+            {
+                if(connection.connectionState!=ConnectionState.Connected)continue;
+                FlushPropertyUpdates(connection,now);
+            }   
         }
         // private void ApplyObjectUpdate(NetworkObject networkObject,ObjectUpdateData update)
         // {
@@ -852,8 +1004,12 @@ namespace UeNet
         // }
         private void QueueReliableBunch(Connection connection,NetBunch bunch)
         {
-            string json=JsonUtility.ToJson(bunch);
-            QueueReliable(connection,NetMessageType.ActorBunch,json);
+            if(!connection.ActorChannels.TryGetValue(bunch.ObjectId,out ActorChannel channel))
+            {
+                channel=new ActorChannel(bunch.ObjectId);
+                connection.ActorChannels.Add(bunch.ObjectId,channel);
+            }
+            channel.QueueReliableBunch(connection.connectionID,bunch);
         }
         private void  HandleActorBunch(Connection connection,string data)
         {
@@ -871,6 +1027,7 @@ namespace UeNet
             // 已关闭对象不能被迟到的消息重新创建。
             if (despawnedObjectIds.Contains(bunch.ObjectId))
                 return;
+            if(isServer&&bunch.Type!=NetBunchType.Rpc)return;
             switch (bunch.Type)
             {
                 case NetBunchType.Open:
@@ -882,8 +1039,53 @@ namespace UeNet
                 case NetBunchType.Close:
                     HandleChannelClose(connection, bunch.ObjectId);
                     break;
+                case NetBunchType.Rpc:
+                    HandleChannelRpc(connection,bunch);
+                    break;
             }
         }
+
+        private void HandleChannelRpc(Connection connection, NetBunch bunch)
+        {
+            RpcCallData call;
+            try
+            {
+                call=JsonUtility.FromJson<RpcCallData>(bunch.PayloadJson);
+            }
+            catch
+            {
+                return;
+            }
+            RpcDirection exceptedDirection=isServer?RpcDirection.Server:RpcDirection.Client;
+            if(call==null||call.Direction!=exceptedDirection)return;
+            if (isServer)
+            {
+                if (!networkObjectRegistry.TryGet(
+                        bunch.ObjectId,
+                        out NetworkObject serverObject) ||
+                    serverObject == null ||
+                    serverObject.OwnerConnectId != connection.connectionID)
+                {
+                    Debug.LogWarning(
+                        $"拒绝无权限的 RPC：ConnectionId={connection.connectionID}, " +
+                        $"ObjectId={bunch.ObjectId}, RpcId={call.RpcId}",
+                        this);
+                    return;
+                }
+            }
+            if(!connection.ActorChannels.TryGetValue(bunch.ObjectId
+                                    ,out ActorChannel channel))
+            {
+                return;
+            }
+            if (!channel.ReceiveRpc(call))
+            {
+                Debug.LogWarning(
+                    $"RPC 未执行：ObjectId={bunch.ObjectId}, RpcId={call.RpcId}",
+                    this);
+            }
+        }
+
         private void HandleChannelOpen(
             Connection connection,
             NetBunch bunch)
@@ -989,7 +1191,7 @@ namespace UeNet
                     out ActorChannel channel))
             {
                 channel.Close();
-                connection.ActorChannels.Remove(objectId);
+                //connection.ActorChannels.Remove(objectId);
             }
             if (networkObjectRegistry.TryGet(
                     objectId,
@@ -1020,6 +1222,56 @@ namespace UeNet
             }
             connection.ActorChannels.Clear();
         }        
+        private void SendClientRpc(Connection connection,uint objectId,
+                            ushort rpcId,string argsJson)
+        {
+            if(!isServer||connection.connectionState!=ConnectionState.Connected
+                ||!connection.ActorChannels.TryGetValue(objectId,
+                    out ActorChannel channel)||channel.State!=ActorChannelState.Open)
+            {
+                return;
+            }
+            var call=new RpcCallData
+            {
+                RpcId=rpcId,
+                Direction=RpcDirection.Client,
+                ArgsJson=argsJson??string.Empty
+            };
+            var bunch=new NetBunch
+            {
+                ObjectId=objectId,
+                Type=NetBunchType.Rpc,
+                PayloadJson=JsonUtility.ToJson(call)
+            };
+            QueueReliableBunch(connection,bunch);
+        }
+        private void SendServerRpc(uint objectId,ushort rpcId,string argsJson)
+        {
+            if(isServer||serverConnection==null||
+                serverConnection.connectionState!=ConnectionState.Connected)
+                {
+                    return;
+                }
+            if(!serverConnection.ActorChannels.TryGetValue(objectId,out ActorChannel channel)||
+                    channel.State != ActorChannelState.Open)
+            {
+                return;
+            }
+            var call=new RpcCallData
+            {
+                RpcId=rpcId,
+                Direction=RpcDirection.Server,
+                ArgsJson=argsJson??string.Empty
+            };
+            var bunch=new NetBunch
+            {
+                ObjectId=objectId,
+                Type=NetBunchType.Rpc,
+                PayloadJson=JsonUtility.ToJson(call)
+            };
+            QueueReliableBunch(serverConnection,bunch);
+        }
+    
     }
 
 }
