@@ -25,8 +25,8 @@ namespace UeNet
         private NetworkObjectRegistry networkObjectRegistry=new NetworkObjectRegistry();
         private HashSet<uint>despawnedObjectIds=new HashSet<uint>();
         private const double StateSyncInterval=0.1;
-       private readonly Dictionary<uint,Dictionary<ushort,PropertyUpdateData>> pendingObjectStates=
-                        new Dictionary<uint, Dictionary<ushort, PropertyUpdateData>>();
+       //private readonly Dictionary<uint,Dictionary<ushort,PropertyUpdateData>> pendingObjectStates=
+                        // Dictionary<uint, Dictionary<ushort, PropertyUpdateData>>();
         private double nextStateSyncTime;
         [SerializeField]private uint testDespawnObjectId=1;
         private readonly Dictionary<uint,ObjectReplicator> objectReplicators=new Dictionary<uint, ObjectReplicator>();
@@ -203,6 +203,7 @@ namespace UeNet
                 existing.connectionState=ConnectionState.DisConnect;
                 existing.Replication.Clear();
                 existing.ReliableReceiver.Clear();
+                ClearActorChannels(existing);
                 connections.Remove(remote);
                 Debug.Log(
                     $"客户端主动断开：{existing.connectionID}");
@@ -277,82 +278,12 @@ namespace UeNet
             {
                 connection.connectionState =
                     ConnectionState.DisConnect;
-
+                ClearActorChannels(connection);
                 Debug.Log("服务端已断开连接");
             }
-            else if (type == NetMessageType.SpawnObject)
+            else if (type == NetMessageType.ActorBunch)
             {
-                 SpawnData spawnData;
-                    try
-                    {
-                        spawnData =
-                            JsonUtility.FromJson<SpawnData>(data);
-                    }
-                    catch (ArgumentException)
-                    {
-                        Debug.LogWarning("收到无法解析的 SpawnObject。", this);
-                        return;
-                    }
-                    if (spawnData == null ||
-                        spawnData.ObjectId == 0 ||
-                        spawnData.ObjectType != "NetworkObject")
-                    {
-                        Debug.LogWarning("收到无效的对象生成数据。", this);
-                        return;
-                    }
-                    if (despawnedObjectIds.Contains(spawnData.ObjectId))
-                    {
-                        Debug.Log(
-                            $"忽略已销毁对象的生成消息：" +
-                            $"ObjectId={spawnData.ObjectId}",
-                            this);
-                        return;
-                    }   
-                    // 对象级去重，防止同一个 ObjectId 创建多个实例。
-                    if (networkObjectRegistry.TryGet(
-                            spawnData.ObjectId,
-                            out NetworkObject existing))
-                    {
-                        return;
-                    }
-                    GameObject instance = new GameObject(
-                        $"{name}_NetworkObject_{spawnData.ObjectId}");
-                    NetworkObject networkObject =
-                        instance.AddComponent<NetworkObject>();
-                    networkObject.Health = spawnData.health;
-                    networkObject.StateVersion=spawnData.StateVersion;
-                    networkObject.transform.position=spawnData.Position;
-                    networkObjectRegistry.RegisterClientObject(
-                        networkObject,
-                        spawnData.ObjectId);
-                    objectReplicators.Add(networkObject.NetObjectId,new ObjectReplicator(networkObject));
-                    if (pendingObjectStates.TryGetValue(
-                            spawnData.ObjectId,
-                            out Dictionary<ushort, PropertyUpdateData> pending))
-                    {
-                        pendingObjectStates.Remove(spawnData.ObjectId);
-
-                        ObjectUpdateData cachedUpdate = new ObjectUpdateData
-                        {
-                            ObjectId = spawnData.ObjectId,
-                            Properties =
-                                new List<PropertyUpdateData>(pending.Values)
-                        };
-                        ApplyObjectUpdate(networkObject, cachedUpdate);
-                    }
-                    Debug.Log(
-                        $"{name} 创建客户端对象：" +
-                        $"ObjectId={networkObject.NetObjectId}，" +
-                        $"Health={networkObject.Health}",
-                        instance);
-            }
-            else if (type == NetMessageType.DespawnObject)
-            {
-                HandleDespawenObject(data);
-            }
-            else if (type == NetMessageType.StateUpdate)
-            {
-                HandleStateUpdate(data);
+                HandleActorBunch(connection,data);
             }
         }
         private void UpdateServer()
@@ -369,6 +300,7 @@ namespace UeNet
                         ConnectionState.DisConnect;
                     connection.Replication.Clear();
                     connection.ReliableReceiver.Clear();
+                    ClearActorChannels(connection);
                     expiredAddresses.Add(pair.Key);
                     continue;
                 }
@@ -402,6 +334,7 @@ namespace UeNet
             {
                 connection.connectionState =
                     ConnectionState.DisConnect;
+                ClearActorChannels(connection);
                 Debug.Log("连接超时");
                 return;
             }
@@ -479,13 +412,14 @@ namespace UeNet
             finally
             {
                 connection.connectionState=ConnectionState.DisConnect;
+                ClearActorChannels(connection);
             }
 
         }
         
         private void CloseTransport()
         {
-            pendingObjectStates.Clear();
+            // pendingObjectStates.Clear();
             objectReplicators.Clear();
             if (serverConnection != null)
             {
@@ -493,6 +427,7 @@ namespace UeNet
                     ConnectionState.DisConnect;
                 serverConnection.Replication.Clear();
                 serverConnection.ReliableReceiver.Clear();
+                ClearActorChannels(serverConnection);
             }
             foreach (Connection connection in connections.Values)
             {
@@ -500,6 +435,7 @@ namespace UeNet
                     ConnectionState.DisConnect;
                 connection.Replication.Clear();
                 connection.ReliableReceiver.Clear();
+                ClearActorChannels(connection);
             }
                 
             connections.Clear();
@@ -574,9 +510,8 @@ namespace UeNet
                 return null;
             if (type != NetMessageType.Heartbeat &&
                 type != NetMessageType.DisConnect&&
-                type!=NetMessageType.ReliableTest&&type != NetMessageType.SpawnObject &&
-    type != NetMessageType.DespawnObject &&
-    type != NetMessageType.StateUpdate)
+                type!=NetMessageType.ReliableTest&&
+                type!=NetMessageType.ActorBunch)
                 return null;
             return server;
         }
@@ -617,16 +552,45 @@ namespace UeNet
             List<ObjectUpdateData> due=connection.Replication.CollectDue(now,RetryInterval);
             foreach(ObjectUpdateData update in due)
             {
-                string json=JsonUtility.ToJson(update);
-                byte[] payload=NetMessage.Encode(NetMessageType.StateUpdate,connection.connectionID,
-                                                    0,false,json);
-                uint packetSequence=SendPayload(connection,payload,0);
-                connection.Replication.RecordSent(packetSequence,update,Now);
+                if (!connection.ActorChannels.TryGetValue(
+                update.ObjectId,
+                out ActorChannel channel))
+                {
+                    continue;
+                }
+                if (channel.State != ActorChannelState.Open)
+                    continue;
+                NetBunch bunch = new NetBunch
+                {
+                    ObjectId = update.ObjectId,
+                    Type = NetBunchType.Properties,
+                    PayloadJson = JsonUtility.ToJson(update)
+                };
+                byte[] payload = NetMessage.Encode(
+                NetMessageType.ActorBunch,
+                connection.connectionID,
+                0,
+                false,
+                JsonUtility.ToJson(bunch));
+                uint packetSequence = SendPayload(
+                    connection,
+                    payload,
+                    0);
+
+                // 仍然记录：这个包携带了哪些属性版本。
+                connection.Replication.RecordSent(
+                    packetSequence,
+                    update,
+                    Now);
             }           
         }
         private void SendSpawnObject(Connection connection,NetworkObject networkObject)
         {
             if(networkObject==null)return;
+            uint objectId = networkObject.NetObjectId;
+            // 同一连接，不重复打开同一个对象通道。
+            if (connection.ActorChannels.ContainsKey(objectId))
+                return;
             SpawnData spawnData = new SpawnData
             {
                 ObjectId = networkObject.NetObjectId,
@@ -635,11 +599,16 @@ namespace UeNet
                 StateVersion=networkObject.StateVersion,
                 Position=networkObject.transform.position
             };
-            string json = JsonUtility.ToJson(spawnData);
-            QueueReliable(
-                connection,
-                NetMessageType.SpawnObject,
-                json);
+            NetBunch bunch=new NetBunch
+            {
+              ObjectId=objectId,
+              Type=NetBunchType.Open,
+              PayloadJson=JsonUtility.ToJson(spawnData)  
+            };
+            QueueReliableBunch(connection,bunch);
+            ActorChannel channel=new ActorChannel(objectId);
+            channel.Bind(networkObject);
+            connection.ActorChannels.Add(objectId,channel);
         }
         private void QueueInitialObjects(Connection connection)
         {
@@ -712,11 +681,6 @@ namespace UeNet
                     return false;
                 }
             }
-            DespawnData despawnData = new DespawnData
-            {
-                ObjectId = objectId
-            };
-            string json = JsonUtility.ToJson(despawnData);
             // 每个客户端有独立的可靠消息队列。
             foreach (Connection connection in connections.Values)
             {
@@ -725,10 +689,21 @@ namespace UeNet
                 {
                     continue;
                 }
-                QueueReliable(
-                    connection,
-                    NetMessageType.DespawnObject,
-                    json);
+                if (connection.ActorChannels.TryGetValue(
+                        objectId,
+                        out ActorChannel channel))
+                {
+                    NetBunch bunch = new NetBunch
+                    {
+                        ObjectId = objectId,
+                        Type = NetBunchType.Close,
+                        PayloadJson = string.Empty
+                    };
+                    connection.Replication.RemoveObject(objectId);
+                    QueueReliableBunch(connection,bunch);
+                    channel.Close();
+                    connection.ActorChannels.Remove(objectId);
+                }
                 connection.Replication.RemoveObject(objectId);
             }
             objectReplicators.Remove(objectId);
@@ -744,38 +719,35 @@ namespace UeNet
                 this);
             return true;
         }
-        private void HandleDespawenObject(string data)
-        {
-            DespawnData despawnData;
-            try
-            {
-                despawnData=JsonUtility.FromJson<DespawnData>(data);
-            }
-            catch(ArgumentException)
-            {
-                return;
-            }
-            if (despawnData == null || despawnData.ObjectId == 0)
-                return;
-            uint objectId=despawnData.ObjectId;
-            // 阻止延迟的生成消息和状态消息重新影响对象。
-            despawnedObjectIds.Add(objectId);
-            // 对象尚未生成时，可能已经缓存过状态。
-            pendingObjectStates.Remove(objectId);
-            objectReplicators.Remove(objectId);
-            if(networkObjectRegistry.TryGet(objectId,out NetworkObject networkObject))
-            {
-                networkObjectRegistry.Remove(objectId);
-                if(networkObject!=null)Destroy(networkObject.gameObject);
-            }
-            Debug.Log(
-                $"{name} 处理对象销毁：ObjectId={objectId}",
-                this);
-        }
-        // private static bool IsNewerStateVersion(uint value,uint reference)
+        // private void HandleDespawenObject(string data)
         // {
-        //     return unchecked((int)(value-reference))>0;
+        //     DespawnData despawnData;
+        //     try
+        //     {
+        //         despawnData=JsonUtility.FromJson<DespawnData>(data);
+        //     }
+        //     catch(ArgumentException)
+        //     {
+        //         return;
+        //     }
+        //     if (despawnData == null || despawnData.ObjectId == 0)
+        //         return;
+        //     uint objectId=despawnData.ObjectId;
+        //     // 阻止延迟的生成消息和状态消息重新影响对象。
+        //     despawnedObjectIds.Add(objectId);
+        //     // 对象尚未生成时，可能已经缓存过状态。
+        //     pendingObjectStates.Remove(objectId);
+        //     objectReplicators.Remove(objectId);
+        //     if(networkObjectRegistry.TryGet(objectId,out NetworkObject networkObject))
+        //     {
+        //         networkObjectRegistry.Remove(objectId);
+        //         if(networkObject!=null)Destroy(networkObject.gameObject);
+        //     }
+        //     Debug.Log(
+        //         $"{name} 处理对象销毁：ObjectId={objectId}",
+        //         this);
         // }
+
         private void BroadcastObjectStates()
         {
             double now=Now;
@@ -795,6 +767,11 @@ namespace UeNet
                 foreach(Connection connection in connections.Values)
                 {
                     if(connection.connectionState!=ConnectionState.Connected)continue;
+                    if (!connection.ActorChannels.ContainsKey(
+                    update.ObjectId))
+                    {
+                        continue;
+                    }
                     connection.Replication.Merge(update);
                 }
                 foreach(Connection connection in connections.Values)
@@ -804,75 +781,245 @@ namespace UeNet
                 }
             }
         }
-        private void ApplyObjectUpdate(NetworkObject networkObject,ObjectUpdateData update)
+        // private void ApplyObjectUpdate(NetworkObject networkObject,ObjectUpdateData update)
+        // {
+        //     if(networkObject==null)return;
+        //     if(objectReplicators.TryGetValue(networkObject.NetObjectId,out ObjectReplicator objectReplicator))
+        //     {
+        //         objectReplicator.ApplyUpdate(update);
+        //     }
+        // }
+        // private void HandleStateUpdate(string data)
+        // {
+        //     ObjectUpdateData update;
+        //     try
+        //     {
+        //         update=JsonUtility.FromJson<ObjectUpdateData>(data);
+        //     }
+        //     catch
+        //     {
+        //         return;
+        //     }
+        //     if(update==null||update.ObjectId==0||update.Properties==null)return;
+        //     if(despawnedObjectIds.Contains(update.ObjectId))return;
+        //     if(networkObjectRegistry.TryGet(update.ObjectId,out NetworkObject networkObject))
+        //     {
+        //         if (networkObject != null)
+        //         {
+        //             ApplyObjectUpdate(networkObject,update);
+        //             return;
+        //         }
+        //     }
+        //      foreach (PropertyUpdateData item in update.Properties)
+        //     {
+        //         if (item == null)
+        //             continue;
+        //         // 只缓存布局认识、且可以解码的属性。
+        //         if (!RepLayout.Instance.TryGetProperty(
+        //                 item.PropertyId,
+        //                 out RepProperty property))
+        //         {
+        //             continue;
+        //         }
+        //         if (!property.TryReadUpdate(
+        //                 item,
+        //                 new ObjectStateData()))
+        //         {
+        //             continue;
+        //         }
+        //         if (!pendingObjectStates.TryGetValue(
+        //                 update.ObjectId,
+        //                 out Dictionary<ushort, PropertyUpdateData> pending))
+        //         {
+        //             pending =
+        //                 new Dictionary<ushort, PropertyUpdateData>();
+
+        //             pendingObjectStates.Add(update.ObjectId, pending);
+        //         }
+        //         if (pending.TryGetValue(
+        //                 item.PropertyId,
+        //                 out PropertyUpdateData previous))
+        //         {
+        //             if (!ObjectReplicator.IsNewerVersion(
+        //                     item.PropertyVersion,
+        //                     previous.PropertyVersion))
+        //             {
+        //                 continue;
+        //             }
+        //         }
+        //         pending[item.PropertyId] = item;
+        //     }
+        // }
+        private void QueueReliableBunch(Connection connection,NetBunch bunch)
         {
-            if(networkObject==null)return;
-            if(objectReplicators.TryGetValue(networkObject.NetObjectId,out ObjectReplicator objectReplicator))
+            string json=JsonUtility.ToJson(bunch);
+            QueueReliable(connection,NetMessageType.ActorBunch,json);
+        }
+        private void  HandleActorBunch(Connection connection,string data)
+        {
+             NetBunch bunch;
+            try
             {
-                objectReplicator.ApplyUpdate(update);
+                bunch = JsonUtility.FromJson<NetBunch>(data);
+            }
+            catch (ArgumentException)
+            {
+                return;
+            }
+            if (bunch == null || bunch.ObjectId == 0)
+                return;
+            // 已关闭对象不能被迟到的消息重新创建。
+            if (despawnedObjectIds.Contains(bunch.ObjectId))
+                return;
+            switch (bunch.Type)
+            {
+                case NetBunchType.Open:
+                    HandleChannelOpen(connection, bunch);
+                    break;
+                case NetBunchType.Properties:
+                    HandleChannelProperties(connection, bunch);
+                    break;
+                case NetBunchType.Close:
+                    HandleChannelClose(connection, bunch.ObjectId);
+                    break;
             }
         }
-        private void HandleStateUpdate(string data)
+        private void HandleChannelOpen(
+            Connection connection,
+            NetBunch bunch)
+        {
+            SpawnData spawnData;
+            try
+            {
+                spawnData =
+                    JsonUtility.FromJson<SpawnData>(
+                        bunch.PayloadJson);
+            }
+            catch (ArgumentException)
+            {
+                return;
+            }
+            if (spawnData == null ||
+                spawnData.ObjectId != bunch.ObjectId ||
+                spawnData.ObjectType != "NetworkObject")
+            {
+                return;
+            }
+            if (!connection.ActorChannels.TryGetValue(
+                    bunch.ObjectId,
+                    out ActorChannel channel))
+            {
+                channel = new ActorChannel(bunch.ObjectId);
+                connection.ActorChannels.Add(
+                    bunch.ObjectId,
+                    channel);
+            }
+            // 防止重复 Open 重置对象状态。
+            if (channel.State != ActorChannelState.Opening)
+                return;
+            NetworkObject networkObject;
+            if (!networkObjectRegistry.TryGet(
+                    bunch.ObjectId,
+                    out networkObject) ||
+                networkObject == null)
+            {
+                GameObject instance = new GameObject(
+                    $"{name}_NetworkObject_{bunch.ObjectId}");
+                networkObject =
+                    instance.AddComponent<NetworkObject>();
+                networkObject.Health = spawnData.health;
+                networkObject.StateVersion =
+                    spawnData.StateVersion;
+                networkObject.transform.position =
+                    spawnData.Position;
+                networkObjectRegistry.RegisterClientObject(
+                    networkObject,
+                    bunch.ObjectId);
+            }
+            // Bind 内部创建客户端复制器，
+            // 并应用在 Open 之前收到的属性更新。
+            channel.Bind(networkObject);
+            Debug.Log(
+                $"打开通道并创建对象：ObjectId={bunch.ObjectId}",
+                networkObject);
+        }
+        private void HandleChannelProperties(
+            Connection connection,
+            NetBunch bunch)
         {
             ObjectUpdateData update;
             try
             {
-                update=JsonUtility.FromJson<ObjectUpdateData>(data);
+                update =
+                    JsonUtility.FromJson<ObjectUpdateData>(
+                        bunch.PayloadJson);
             }
-            catch
+            catch (ArgumentException)
             {
                 return;
             }
-            if(update==null||update.ObjectId==0||update.Properties==null)return;
-            if(despawnedObjectIds.Contains(update.ObjectId))return;
-            if(networkObjectRegistry.TryGet(update.ObjectId,out NetworkObject networkObject))
+            if (update == null ||
+                update.ObjectId != bunch.ObjectId ||
+                update.Properties == null)
             {
-                if (networkObject != null)
-                {
-                    ApplyObjectUpdate(networkObject,update);
-                    return;
-                }
+                return;
             }
-             foreach (PropertyUpdateData item in update.Properties)
-            {
-                if (item == null)
-                    continue;
-                // 只缓存布局认识、且可以解码的属性。
-                if (!RepLayout.Instance.TryGetProperty(
-                        item.PropertyId,
-                        out RepProperty property))
-                {
-                    continue;
-                }
-                if (!property.TryReadUpdate(
-                        item,
-                        new ObjectStateData()))
-                {
-                    continue;
-                }
-                if (!pendingObjectStates.TryGetValue(
-                        update.ObjectId,
-                        out Dictionary<ushort, PropertyUpdateData> pending))
-                {
-                    pending =
-                        new Dictionary<ushort, PropertyUpdateData>();
 
-                    pendingObjectStates.Add(update.ObjectId, pending);
-                }
-                if (pending.TryGetValue(
-                        item.PropertyId,
-                        out PropertyUpdateData previous))
-                {
-                    if (!ObjectReplicator.IsNewerVersion(
-                            item.PropertyVersion,
-                            previous.PropertyVersion))
-                    {
-                        continue;
-                    }
-                }
-                pending[item.PropertyId] = item;
+            if (!connection.ActorChannels.TryGetValue(
+                    bunch.ObjectId,
+                    out ActorChannel channel))
+            {
+                // 属性先于 Open 到达：
+                // 先创建 Opening 状态的通道。
+                channel = new ActorChannel(bunch.ObjectId);
+                connection.ActorChannels.Add(
+                    bunch.ObjectId,
+                    channel);
             }
+            channel.ReceiveProperties(update);
         }
+        private void HandleChannelClose(
+            Connection connection,
+            uint objectId)
+        {
+            // 先标记销毁，阻止迟到属性重新建立通道。
+            despawnedObjectIds.Add(objectId);
+            if (connection.ActorChannels.TryGetValue(
+                    objectId,
+                    out ActorChannel channel))
+            {
+                channel.Close();
+                connection.ActorChannels.Remove(objectId);
+            }
+            if (networkObjectRegistry.TryGet(
+                    objectId,
+                    out NetworkObject networkObject))
+            {
+                networkObjectRegistry.Remove(objectId);
+                if (networkObject != null)
+                    Destroy(networkObject.gameObject);
+            }
+            Debug.Log(
+                $"关闭通道并销毁对象：ObjectId={objectId}",
+                this);
+        }
+        private void ClearActorChannels(Connection connection)
+        {
+            foreach (ActorChannel channel
+                    in connection.ActorChannels.Values)
+            {
+                NetworkObject target = channel.Target;
+                channel.Close();
+                // 客户端断线时清理复制出来的对象。
+                if (!isServer && target != null)
+                {
+                    networkObjectRegistry.Remove(
+                        channel.ObjectId);
+                    Destroy(target.gameObject);
+                }
+            }
+            connection.ActorChannels.Clear();
+        }        
     }
 
 }

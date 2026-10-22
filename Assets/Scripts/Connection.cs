@@ -20,6 +20,7 @@ namespace UeNet
         public ReliableMessageQueue ReliableMessageQueue{get;}=new ReliableMessageQueue();
         public ConnectionReplicationState Replication{get;}=new ConnectionReplicationState();
         public ReliableReceiveBuffer ReliableReceiver{get;}=new ReliableReceiveBuffer();
+        public Dictionary<uint,ActorChannel> ActorChannels{get;}=new Dictionary<uint, ActorChannel>();
         public bool InitialObjectsQueued{get;internal set;}
         public Connection(string remoteAs,double now)
         {

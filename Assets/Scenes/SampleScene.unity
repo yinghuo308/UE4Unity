@@ -288,6 +288,7 @@ MonoBehaviour:
   isServer: 1
   serverPort: 7777
   serverAddress: 127.0.0.1:7777
+  testDespawnObjectId: 1
 --- !u!4 &155123753
 Transform:
   m_ObjectHideFlags: 0
@@ -336,6 +337,7 @@ MonoBehaviour:
   isServer: 0
   serverPort: 7777
   serverAddress: 127.0.0.1:7777
+  testDespawnObjectId: 1
 --- !u!4 &192311522
 Transform:
   m_ObjectHideFlags: 0
@@ -395,6 +397,7 @@ MonoBehaviour:
   isServer: 0
   serverPort: 7777
   serverAddress: 127.0.0.1:7777
+  testDespawnObjectId: 1
 --- !u!4 &312801489
 Transform:
   m_ObjectHideFlags: 0

@@ -15,7 +15,8 @@ namespace UeNet
 
         SpawnObject=6,
         DespawnObject=7,
-        StateUpdate=8
+        StateUpdate=8,
+        ActorBunch=9
     }
     [Serializable]
         public class SpawnData
@@ -112,7 +113,7 @@ namespace UeNet
                 if (message.Type <
                         (int)NetMessageType.ConnectRequest ||
                     message.Type >
-                        (int)NetMessageType.StateUpdate)
+                        (int)NetMessageType.ActorBunch)
                     return false;
                 type = (NetMessageType)message.Type;
                 connectionId = message.ConnectionId;
