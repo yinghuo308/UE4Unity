@@ -100,7 +100,7 @@ namespace UeNet
                     continue;
                 double now = Now;
                 // 4. 对方告诉我们：自己发出的哪些包已被收到。
-                int confirmed = connection.Packets.ProcessAck(
+                connection.Packets.ProcessAck(
                     packet, now,acknowledgedSequences);
                 
                 for (int ackIndex = 0;
@@ -112,28 +112,55 @@ namespace UeNet
                     connection.ReliableMessageQueue
                         .AcknowledgePacket(
                             acknowledgedSequence);
+                    int confirmedProperties=connection.Replication.AcknowledgePacket(acknowledgedSequence);
+                    if (confirmedProperties > 0)
+                    {
+                          Debug.Log(
+                            $"连接 {connection.connectionID}：" +
+                            $"包 {acknowledgedSequence} 确认了 " +
+                            $"{confirmedProperties} 个属性",
+                            this);
+                    }
                 }
+                if(reliable&&!connection.ReliableReceiver.CanAccept(messageId))continue;
+
                 // 5. 记录收到的编号，过滤重复包和过旧的包。
                 if (!connection.Packets.RecordReceived(packet.Sequence))
                     continue;
                 // 6. 收到一个新的、有效的连接消息。
                 connection.lastReceiveTime = now;
-                 if (reliable &&
-                        !connection.ReliableMessageQueue
-                        .AcceptIncoming(messageId))
+                // 8. 不可靠消息直接交给业务处理。
+                if (!reliable)
                 {
-                    Debug.Log(
-                        $"{name} 忽略重复可靠消息：MessageId={messageId}",
-                        this);
+                    DispatchMessage(
+                        datagram.Remote,
+                        type,
+                        connectionId,
+                        data);
                     continue;
                 }
-                if (isServer)
+                // 9. 可靠消息进入有序缓冲。
+                var received = new ReceivedReliableMessage(
+                    type,
+                    connectionId,
+                    messageId,
+                    data);
+                List<ReceivedReliableMessage> ready =
+                    connection.ReliableReceiver.Receive(
+                        received);
+                // 10. 只执行当前已经连续到达的可靠消息。
+                foreach (ReceivedReliableMessage message in ready)
                 {
-                    HandleServerMessage(datagram.Remote,type,connectionId,data);
-                }
-                else
-                {
-                    HandleClientMessage(datagram.Remote,type,connectionId,data);
+                    DispatchMessage(
+                        connection.remoteAddress,
+                        message.Type,
+                        message.ConnectionId,
+                        message.Data);
+                    if (connection.connectionState ==
+                        ConnectionState.DisConnect)
+                    {
+                        break;
+                    }
                 }
             }
         }
@@ -174,9 +201,33 @@ namespace UeNet
             else if (type == NetMessageType.DisConnect)
             {
                 existing.connectionState=ConnectionState.DisConnect;
+                existing.Replication.Clear();
+                existing.ReliableReceiver.Clear();
                 connections.Remove(remote);
                 Debug.Log(
                     $"客户端主动断开：{existing.connectionID}");
+            }
+        }
+        private void DispatchMessage(string remote,
+            NetMessageType type,
+            uint connectionId,
+            string data)
+        {
+            if (isServer)
+            {
+                HandleServerMessage(
+                    remote,
+                    type,
+                    connectionId,
+                    data);
+            }
+            else
+            {
+                HandleClientMessage(
+                    remote,
+                    type,
+                    connectionId,
+                    data);
             }
         }
         private void HandleClientMessage(string remote, NetMessageType type, 
@@ -316,7 +367,8 @@ namespace UeNet
                 {
                     connection.connectionState =
                         ConnectionState.DisConnect;
-
+                    connection.Replication.Clear();
+                    connection.ReliableReceiver.Clear();
                     expiredAddresses.Add(pair.Key);
                     continue;
                 }
@@ -380,7 +432,7 @@ namespace UeNet
             byte[] payload=NetMessage.Encode(type,connection.connectionID);
             SendPayload(connection,payload,0);
         }
-        private void SendPayload(
+        private uint SendPayload(
             Connection connection,
             byte[] payload,
             uint reliableMessageId)
@@ -404,6 +456,7 @@ namespace UeNet
                     now);
             }
             connection.lastSendTime = now;
+            return packet.Sequence;
 
             // Debug.Log(
             //     $"{name} 发送包：Seq={packet.Sequence}，" +
@@ -427,17 +480,28 @@ namespace UeNet
             {
                 connection.connectionState=ConnectionState.DisConnect;
             }
+
         }
+        
         private void CloseTransport()
         {
             pendingObjectStates.Clear();
             objectReplicators.Clear();
             if (serverConnection != null)
+            {
                 serverConnection.connectionState =
                     ConnectionState.DisConnect;
+                serverConnection.Replication.Clear();
+                serverConnection.ReliableReceiver.Clear();
+            }
             foreach (Connection connection in connections.Values)
+            {
                 connection.connectionState =
                     ConnectionState.DisConnect;
+                connection.Replication.Clear();
+                connection.ReliableReceiver.Clear();
+            }
+                
             connections.Clear();
 
             if (transport == null)
@@ -548,6 +612,18 @@ namespace UeNet
                     message.MessageId);
             }
         }
+        private void FlushPropertyUpdates(Connection connection,double now)
+        {
+            List<ObjectUpdateData> due=connection.Replication.CollectDue(now,RetryInterval);
+            foreach(ObjectUpdateData update in due)
+            {
+                string json=JsonUtility.ToJson(update);
+                byte[] payload=NetMessage.Encode(NetMessageType.StateUpdate,connection.connectionID,
+                                                    0,false,json);
+                uint packetSequence=SendPayload(connection,payload,0);
+                connection.Replication.RecordSent(packetSequence,update,Now);
+            }           
+        }
         private void SendSpawnObject(Connection connection,NetworkObject networkObject)
         {
             if(networkObject==null)return;
@@ -653,6 +729,7 @@ namespace UeNet
                     connection,
                     NetMessageType.DespawnObject,
                     json);
+                connection.Replication.RemoveObject(objectId);
             }
             objectReplicators.Remove(objectId);
             // 从服务器注册表移除。
@@ -715,13 +792,15 @@ namespace UeNet
                 {
                     continue;
                 }
-                string json=JsonUtility.ToJson(update);
                 foreach(Connection connection in connections.Values)
                 {
                     if(connection.connectionState!=ConnectionState.Connected)continue;
-                    byte []payload=NetMessage.Encode(NetMessageType.StateUpdate,connection.connectionID
-                                                    ,0,false,json);
-                    SendPayload(connection,payload,0);
+                    connection.Replication.Merge(update);
+                }
+                foreach(Connection connection in connections.Values)
+                {
+                    if(connection.connectionState!=ConnectionState.Connected)continue;
+                    FlushPropertyUpdates(connection,now);
                 }
             }
         }

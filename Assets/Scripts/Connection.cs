@@ -18,6 +18,8 @@ namespace UeNet
         public double lastSendTime{get;internal set;}
         public PacketState Packets{get;}=new PacketState();
         public ReliableMessageQueue ReliableMessageQueue{get;}=new ReliableMessageQueue();
+        public ConnectionReplicationState Replication{get;}=new ConnectionReplicationState();
+        public ReliableReceiveBuffer ReliableReceiver{get;}=new ReliableReceiveBuffer();
         public bool InitialObjectsQueued{get;internal set;}
         public Connection(string remoteAs,double now)
         {
