@@ -3,6 +3,7 @@ using System.Collections;
 using System.Collections.Generic;
 using Unity.VisualScripting;
 using UnityEngine;
+using UnityEngine.SocialPlatforms;
 namespace UeNet
 {
     public class NetworkDriver : MonoBehaviour
@@ -24,12 +25,15 @@ namespace UeNet
         private List<uint> acknowledgedSequences=new List<uint>(32);
         private NetworkObjectRegistry networkObjectRegistry=new NetworkObjectRegistry();
         private HashSet<uint>despawnedObjectIds=new HashSet<uint>();
+        private readonly HashSet<uint>pendingPlayerDespawns=new HashSet<uint>();
         private const double StateSyncInterval=0.1;
        //private readonly Dictionary<uint,Dictionary<ushort,PropertyUpdateData>> pendingObjectStates=
                         // Dictionary<uint, Dictionary<ushort, PropertyUpdateData>>();
         private double nextStateSyncTime;
         [SerializeField]private uint testDespawnObjectId=1;
         [SerializeField]private uint testRpcObjectId=1;
+        [SerializeField]private uint testAttackTargetObject=2;
+        private uint localPlayerObjectId;
         private readonly Dictionary<uint,ObjectReplicator> objectReplicators=new Dictionary<uint, ObjectReplicator>();
         [ContextMenu("测试服务器销毁")]
         public void DespawnTestObject()
@@ -38,7 +42,7 @@ namespace UeNet
         }
         void Awake()
         {
-            RpcRegistry.Register(1, (target, argsJson) =>
+             RpcRegistry.Register(1, (target, argsJson) =>
             {
                 HitRpcArgs args;
                 try
@@ -54,28 +58,68 @@ namespace UeNet
                 $"收到受击 RPC：ObjectId={target.NetObjectId}, Damage={args.Damage}",
                 target);
             });
-            RpcRegistry.Register(101, (target, argsJson) =>
+            if(isServer)
             {
-                HitRpcArgs args;
+            RpcRegistry.Register(101, (attacker, argsJson) =>
+            {
+                if (!isServer || attacker == null || !attacker.IsServerObject)
+                return;
+                AttackRpcArgs args;
                 try
                 {
-                    args = JsonUtility.FromJson<HitRpcArgs>(argsJson);
+                    args = JsonUtility.FromJson<AttackRpcArgs>(argsJson);
                 }
                 catch (ArgumentException)
                 {
                     return;
                 }
-                if (args == null || args.Damage <= 0 || args.Damage > 50)
+                if (args == null || args.TargetObjectId == 0 || args.TargetObjectId==attacker.NetObjectId)
                     return;
                 // 该 handler 应只处理服务器上的权威对象。
-                if (!target.IsServerObject)
+                if (!networkObjectRegistry.TryGet(args.TargetObjectId,out NetworkObject victim)||
+                        victim == null || !victim.IsServerObject)
+                {
+                    Debug.LogWarning(
+                        $"攻击目标不存在：ObjectId={args.TargetObjectId}",
+                        this);
                     return;
-                target.Health = Mathf.Max(0, target.Health - args.Damage);
-                Debug.Log(
-                    $"服务器处理请求：ObjectId={target.NetObjectId}, " +
-                    $"Health={target.Health}",
-                    target);
+                }
+                float distance=Vector3.Distance(attacker.transform.position,
+                        victim.transform.position);
+                if (distance > 3f)
+                {
+                    Debug.LogWarning(
+                        $"攻击距离过远：Distance={distance:F2}",
+                        this);
+                    return;
+                }
+                attacker.Target=victim;
+                const int damage = 10;
+                victim.Health = Mathf.Max(0, victim.Health - damage);
+                            Debug.Log(
+                $"攻击成功：attacker={attacker.NetObjectId}, " +
+                $"target={victim.NetObjectId}, Health={victim.Health}",
+                victim);
+                string hitArgsJson=JsonUtility.ToJson(new HitRpcArgs{Damage=damage});
+                foreach (Connection connection in connections.Values)
+                {
+                    if (connection.connectionState != ConnectionState.Connected)
+                        continue;
+                    if (!connection.ActorChannels.TryGetValue(
+                            victim.NetObjectId,
+                            out ActorChannel channel) ||
+                        channel.State != ActorChannelState.Open)
+                    {
+                        continue;
+                    }
+                    SendClientRpc(
+                        connection,
+                        victim.NetObjectId,
+                        1,
+                        hitArgsJson);
+                }
             });
+            }
             Application.runInBackground=true;
         }
         // Start is called before the first frame update
@@ -254,6 +298,7 @@ namespace UeNet
                 // 所以接受消息可以直接携带对这个请求的 ACK。
                 Send(connection, NetMessageType.ConnectAccept);
                 QueueInitialObjects(connection);
+                SpawnPlayerForConnection(connection);
                 return;
             }
              if (!connections.TryGetValue(
@@ -285,6 +330,10 @@ namespace UeNet
             else if (type == NetMessageType.ActorBunch)
             {
                 HandleActorBunch(existing,data);
+            }
+            else if (type == NetMessageType.DisConnect)
+            {
+                RemoveServerConnection( existing,"客户端主动断开");
             }
         }
         private void DispatchMessage(string remote,
@@ -376,9 +425,6 @@ namespace UeNet
                 {
                     connection.connectionState =
                         ConnectionState.DisConnect;
-                    connection.Replication.Clear();
-                    connection.ReliableReceiver.Clear();
-                    ClearActorChannels(connection);
                     expiredAddresses.Add(pair.Key);
                     continue;
                 }
@@ -392,12 +438,17 @@ namespace UeNet
             }
             foreach (string address in expiredAddresses)
             {
-                Debug.Log($"客户端超时：{address}");
-                connections.Remove(address);
+               if (connections.TryGetValue(
+                address,
+                out Connection connection))
+                {
+                    RemoveServerConnection(connection,"收包超时");
+                }
             }
             if (now >= nextStateSyncTime)
             {
                 nextStateSyncTime=now+StateSyncInterval;
+                ProcessPendingPlayerDespawns();
                 BroadcastObjectStates();
             }
         }
@@ -497,7 +548,7 @@ namespace UeNet
         
         private void CloseTransport()
         {
-            // pendingObjectStates.Clear();
+            pendingPlayerDespawns.Clear();
             objectReplicators.Clear();
             if (serverConnection != null)
             {
@@ -517,7 +568,7 @@ namespace UeNet
             }
                 
             connections.Clear();
-
+            networkObjectRegistry.Clear();
             if (transport == null)
                 return;
 
@@ -692,9 +743,11 @@ namespace UeNet
             {
                 ObjectId = networkObject.NetObjectId,
                 ObjectType = "NetworkObject",
+                OwnerConnectId=networkObject.OwnerConnectId,
                 health = networkObject.Health,
                 StateVersion=networkObject.StateVersion,
-                Position=networkObject.transform.position
+                Position=networkObject.transform.position,
+                TargetObjectId=networkObject.TargetObjectId
             };
             NetBunch bunch=new NetBunch
             {
@@ -725,7 +778,7 @@ namespace UeNet
                 "排入已有对象的生成消息。",
                 this);
         }
-        [ContextMenu("测试服务器生成对象")]
+        [ContextMenu("测试服务器补齐对象")]
         public void SpawnTestObject()
         {
             if(!isServer||transport==null)
@@ -733,33 +786,9 @@ namespace UeNet
                 Debug.LogWarning("请在运行中的服务器上调用。", this);
                 return;
             }
-            var connectedClients = new List<Connection>();
-            foreach (Connection connection in connections.Values)
+             foreach (Connection connection in connections.Values)
             {
-                if (connection.connectionState == ConnectionState.Connected)
-                    connectedClients.Add(connection);
-            }
-             if (connectedClients.Count == 0)
-            {
-                Debug.LogWarning("当前没有已连接的客户端。", this);
-                return;
-            }
-            foreach(Connection ownerConnection in connectedClients)
-            {
-                GameObject instance=new GameObject($"ServerPlayerObject_{ownerConnection.connectionID}");
-                NetworkObject networkObject=instance.AddComponent<NetworkObject>();
-                networkObject.Health=100;
-                networkObjectRegistry.RegisterServerObject(networkObject);
-                networkObject.OwnerConnectId=ownerConnection.connectionID;
-                objectReplicators.Add(networkObject.NetObjectId,new ObjectReplicator(networkObject));
-                foreach(Connection recipient in connectedClients)
-                {
-                    SendSpawnObject(recipient,networkObject);
-                }
-                 Debug.Log(
-                    $"服务器生成对象：ObjectId={networkObject.NetObjectId}, " +
-                    $"OwnerConnectionId={networkObject.OwnerConnectId}",
-                    instance);
+                SpawnPlayerForConnection(connection);
             }
         }
        [ContextMenu("测试发送受击 RPC")]
@@ -803,10 +832,51 @@ namespace UeNet
                 Debug.LogWarning("这个测试入口必须在客户端运行。", this);
                 return;
             }
+             Connection connection = serverConnection;
+            if (connection == null ||
+                connection.connectionState != ConnectionState.Connected)
+            {
+                Debug.LogWarning("尚未连接服务器。", this);
+                return;
+            }
+            if (localPlayerObjectId == 0)
+            {
+                Debug.LogWarning(
+                    "尚未收到属于当前客户端的玩家对象。",
+                    this);
+                return;
+            }
+            if(!networkObjectRegistry.TryGet(localPlayerObjectId,out NetworkObject player)||
+                                player==null||player.IsServerObject
+                                || player.OwnerConnectId != connection.connectionID)
+            {
+                Debug.LogWarning("本地玩家不存在或所有者不匹配",this);
+                return;
+            }
+            if (!connection.ActorChannels.TryGetValue(
+                        localPlayerObjectId,
+                        out ActorChannel channel) ||
+                    channel.State != ActorChannelState.Open)
+                {
+                    Debug.LogWarning(
+                        "本地玩家对象的通道尚未打开。",
+                        this);
+                    return;
+                }
+            if (testAttackTargetObject == 0 ||
+                testAttackTargetObject == localPlayerObjectId)
+            {
+                Debug.LogWarning(
+                    "请选择其他有效对象作为攻击目标。",
+                    this);
+                return;
+            }
             SendServerRpc(
-                testRpcObjectId,
+                localPlayerObjectId,
                 101,
-                JsonUtility.ToJson(new HitRpcArgs { Damage = 10 }));
+                JsonUtility.ToJson(new AttackRpcArgs { TargetObjectId=testAttackTargetObject}),
+                testAttackTargetObject
+                );
         }
         public bool DespawnServerObject(uint objectId)
         {
@@ -1078,7 +1148,7 @@ namespace UeNet
             {
                 return;
             }
-            if (!channel.ReceiveRpc(call))
+            if (!channel.ReceiveRpc(call,networkObjectRegistry))
             {
                 Debug.LogWarning(
                     $"RPC 未执行：ObjectId={bunch.ObjectId}, RpcId={call.RpcId}",
@@ -1140,7 +1210,21 @@ namespace UeNet
             }
             // Bind 内部创建客户端复制器，
             // 并应用在 Open 之前收到的属性更新。
+            networkObject.OwnerConnectId=spawnData.OwnerConnectId;
+            networkObject.ApplyTargetId(spawnData.TargetObjectId);
             channel.Bind(networkObject);
+            ResolvePendingRpcs(connection);
+            if (networkObject.OwnerConnectId != 0 &&
+                networkObject.OwnerConnectId == connection.connectionID)
+            {
+                localPlayerObjectId = networkObject.NetObjectId;
+
+                Debug.Log(
+                    $"{name} 识别到自己的玩家对象：" +
+                    $"ConnectionId={connection.connectionID}, " +
+                    $"ObjectId={localPlayerObjectId}",
+                    this);
+            }
             Debug.Log(
                 $"打开通道并创建对象：ObjectId={bunch.ObjectId}",
                 networkObject);
@@ -1184,6 +1268,10 @@ namespace UeNet
             Connection connection,
             uint objectId)
         {
+            if (localPlayerObjectId == objectId)
+            {
+                localPlayerObjectId = 0;
+            }
             // 先标记销毁，阻止迟到属性重新建立通道。
             despawnedObjectIds.Add(objectId);
             if (connection.ActorChannels.TryGetValue(
@@ -1193,20 +1281,22 @@ namespace UeNet
                 channel.Close();
                 //connection.ActorChannels.Remove(objectId);
             }
-            if (networkObjectRegistry.TryGet(
+            networkObjectRegistry.TryGet(
                     objectId,
-                    out NetworkObject networkObject))
-            {
+                    out NetworkObject networkObject);
                 networkObjectRegistry.Remove(objectId);
                 if (networkObject != null)
                     Destroy(networkObject.gameObject);
-            }
             Debug.Log(
                 $"关闭通道并销毁对象：ObjectId={objectId}",
                 this);
         }
         private void ClearActorChannels(Connection connection)
         {
+            if (!isServer)
+            {
+                localPlayerObjectId = 0;
+            }
             foreach (ActorChannel channel
                     in connection.ActorChannels.Values)
             {
@@ -1221,6 +1311,7 @@ namespace UeNet
                 }
             }
             connection.ActorChannels.Clear();
+            if(!isServer)networkObjectRegistry.Clear();
         }        
         private void SendClientRpc(Connection connection,uint objectId,
                             ushort rpcId,string argsJson)
@@ -1245,7 +1336,7 @@ namespace UeNet
             };
             QueueReliableBunch(connection,bunch);
         }
-        private void SendServerRpc(uint objectId,ushort rpcId,string argsJson)
+        private void SendServerRpc(uint objectId,ushort rpcId,string argsJson,params uint[]objectReferenceIds)
         {
             if(isServer||serverConnection==null||
                 serverConnection.connectionState!=ConnectionState.Connected)
@@ -1261,7 +1352,8 @@ namespace UeNet
             {
                 RpcId=rpcId,
                 Direction=RpcDirection.Server,
-                ArgsJson=argsJson??string.Empty
+                ArgsJson=argsJson??string.Empty,
+                ObjectReferenceIds=objectReferenceIds==null?null:new List<uint>(objectReferenceIds)
             };
             var bunch=new NetBunch
             {
@@ -1271,7 +1363,111 @@ namespace UeNet
             };
             QueueReliableBunch(serverConnection,bunch);
         }
-    
+        private void SpawnPlayerForConnection(Connection owner)
+        {
+            if (!isServer ||
+                transport == null ||
+                owner == null ||
+                owner.connectionState != ConnectionState.Connected)
+            {
+                return;
+            }
+             if (owner.PlayerObjectId != 0)
+                return;
+            GameObject instance = new GameObject(
+                $"ServerPlayerObject_{owner.connectionID}");
+            NetworkObject player =
+                instance.AddComponent<NetworkObject>();
+            player.Health = 100;
+            // 注册服务器对象，分配网络对象编号。
+            networkObjectRegistry.RegisterServerObject(player);
+            // 指定这个对象由哪个客户端控制。
+            player.OwnerConnectId = owner.connectionID;
+            // 建立“连接 → 玩家对象”的关系。
+            owner.PlayerObjectId = player.NetObjectId;
+            // 创建服务器属性复制器。
+            objectReplicators.Add(
+                player.NetObjectId,
+                new ObjectReplicator(player));
+            // 所有客户端都需要看到这个新玩家。
+            foreach (Connection recipient in connections.Values)
+            {
+                if (recipient.connectionState !=
+                    ConnectionState.Connected)
+                {
+                    continue;
+                }
+                SendSpawnObject(recipient, player);
+            }
+            Debug.Log(
+                $"自动生成玩家：" +
+                $"ConnectionId={owner.connectionID}, " +
+                $"ObjectId={player.NetObjectId}",
+                player);
+                }
+        private void RemoveServerConnection(
+            Connection connection,
+            string reason)
+        {
+            if (!isServer || connection == null)
+                return;
+            uint playerObjectId = connection.PlayerObjectId;
+            connection.connectionState =
+                ConnectionState.DisConnect;
+            connection.PlayerObjectId = 0;
+            connection.Replication.Clear();
+            connection.ReliableReceiver.Clear();
+            // 服务器这里只清理这个连接的通道，
+            // 不直接销毁服务器的玩家对象。
+            ClearActorChannels(connection);
+            connections.Remove(connection.remoteAddress);
+            // 玩家销毁统一交给后续处理。
+            if (playerObjectId != 0)
+            {
+               pendingPlayerDespawns.Add(playerObjectId);
+            }
+            Debug.Log(
+                $"移除客户端：" +
+                $"ConnectionId={connection.connectionID}, " +
+                $"PlayerObjectId={playerObjectId}, " +
+                $"Reason={reason}",
+                this);
+        }
+        private void ProcessPendingPlayerDespawns()
+        {
+            if (pendingPlayerDespawns.Count == 0)
+                return;
+            // 遍历副本，允许处理过程中删除原集合里的编号。
+            var objectIds =
+                new List<uint>(pendingPlayerDespawns);
+            foreach (uint objectId in objectIds)
+            {
+                // 对象可能已经通过其他入口销毁。
+                if (!networkObjectRegistry.TryGet(
+                        objectId,
+                        out _))
+                {
+                    pendingPlayerDespawns.Remove(objectId);
+                    continue;
+                }
+                // 复用现有逻辑：
+                // 发 Close Bunch、清理复制器、删除服务器对象。
+                if (DespawnServerObject(objectId))
+                {
+                    pendingPlayerDespawns.Remove(objectId);
+                }
+                // 失败时保留编号，下次再尝试。
+            }
+        }
+        private void ResolvePendingRpcs(Connection connection)
+        {
+            if(connection==null)return;
+            foreach(ActorChannel channel in connection.ActorChannels.Values)
+            {
+                int executed=channel.ResolvePendingRpc(networkObjectRegistry);
+                if(executed>0)Debug.Log($"执行了{executed}条延迟RPC",this);
+            }
+        }
     }
 
 }

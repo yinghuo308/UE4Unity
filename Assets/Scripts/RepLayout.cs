@@ -30,6 +30,14 @@ namespace UeNet
                     valuesEqual: (a, b) =>
                         (a - b).sqrMagnitude <=
                         PositionThreshold * PositionThreshold
+                ),
+                new RepProperty<uint>(
+                    propertyId:3,
+                    name:"Target",
+                    readObject:obj=>obj.TargetObjectId,
+                    writeObject:(obj,value)=>obj.ApplyTargetId(value),
+                    readState:state=>state.TargetObjectId,
+                    writeState:(state,value)=>state.TargetObjectId=value
                 )
             };
         }

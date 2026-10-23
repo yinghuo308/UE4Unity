@@ -21,6 +21,7 @@ namespace UeNet
         public ConnectionReplicationState Replication{get;}=new ConnectionReplicationState();
         public ReliableReceiveBuffer ReliableReceiver{get;}=new ReliableReceiveBuffer();
         public Dictionary<uint,ActorChannel> ActorChannels{get;}=new Dictionary<uint, ActorChannel>();
+        public uint PlayerObjectId{get;internal set;}
         public bool InitialObjectsQueued{get;internal set;}
         public Connection(string remoteAs,double now)
         {

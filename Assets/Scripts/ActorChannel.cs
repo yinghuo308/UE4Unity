@@ -16,6 +16,8 @@ public class ActorChannel
     public ActorChannelState State{get;private set;}
     private ObjectReplicator replicator;
     private const int MaxPendingProperties=64;
+    private const int MaxPendingRpc=64;
+    private readonly List<RpcCallData> pendingRpcs=new List<RpcCallData>();
     private readonly Dictionary<ushort,PropertyUpdateData> pendingProperties =
         new Dictionary<ushort, PropertyUpdateData>();
     public ReliableMessageQueue ReliableSender{get;}=new ReliableMessageQueue();
@@ -95,6 +97,7 @@ public class ActorChannel
         Target = null;
         replicator = null;
         pendingProperties.Clear();
+        pendingRpcs.Clear();
     }
     public uint QueueReliableBunch(uint connectionId,NetBunch bunch)
     {
@@ -111,10 +114,45 @@ public class ActorChannel
         Target=null;
         replicator=null;
         pendingProperties.Clear();
+        pendingRpcs.Clear();
     }
-    public bool ReceiveRpc(RpcCallData call)
+    public bool ReceiveRpc(RpcCallData call,NetworkObjectRegistry registry)
     {
-        if(call==null||State!=ActorChannelState.Open||Target==null)return false;
+        if(call==null||State!=ActorChannelState.Open
+                    ||Target==null||registry==null)return false;
+        if(CanResolveReference(call,registry))
         return RpcRegistry.TryInvoke(call.RpcId,Target,call.ArgsJson);
+        if(pendingRpcs.Count>=MaxPendingRpc)return false;
+        pendingRpcs.Add(call);
+        return true;
+    }
+    private static bool CanResolveReference(RpcCallData call,NetworkObjectRegistry registry)
+    {
+        if(call.ObjectReferenceIds==null)return true;
+        foreach(uint objectId in call.ObjectReferenceIds)
+        {
+            if(objectId==0)continue;
+            if(!registry.TryGet(objectId,out NetworkObject target)||target==null)
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+    public int ResolvePendingRpc(NetworkObjectRegistry registry)
+    {
+        if(registry==null)return 0;
+        int excuted=0;
+        while (pendingRpcs.Count > 0)
+        {
+            RpcCallData call=pendingRpcs[0];
+            if(!CanResolveReference(call,registry))break;
+            pendingRpcs.RemoveAt(0);
+            if (Target != null && RpcRegistry.TryInvoke(call.RpcId, Target, call.ArgsJson))
+            {
+                excuted++;
+            }
+        }
+        return excuted;
     }
 }

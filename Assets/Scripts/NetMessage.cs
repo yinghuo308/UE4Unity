@@ -23,9 +23,11 @@ namespace UeNet
         {
             public uint ObjectId;
             public string ObjectType;
+            public uint OwnerConnectId;
             public int health;
             public uint StateVersion;
             public Vector3 Position;
+            public uint TargetObjectId;
         }
     [Serializable]
     public class ObjectStateData
@@ -34,6 +36,7 @@ namespace UeNet
         public uint StateVersion;
         public int Health;
         public Vector3 Position;
+        public uint TargetObjectId;
     }
     [Serializable]
     public class DespawnData
