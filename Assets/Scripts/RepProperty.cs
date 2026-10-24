@@ -13,11 +13,40 @@ namespace UeNet
             PropertyId=propertyId;
             Name=name;
         }
+        public enum ReplicationCondition
+        {
+            Everyone,
+            OwnerOnly,
+            SkipOwner
+        }
         public abstract void Capture(NetworkObject target,ObjectStateData state);
         public abstract void Apply(NetworkObject target,ObjectStateData state);
         public abstract bool HasChanged(ObjectStateData previous,ObjectStateData current);
         public abstract PropertyUpdateData CreateUpdate(ObjectStateData state,uint version);
         public abstract bool TryReadUpdate(PropertyUpdateData update,ObjectStateData state);
+        public ReplicationCondition Condition{get;}
+        protected RepProperty(ushort propertyId,string name,
+                    ReplicationCondition condition = ReplicationCondition.Everyone)
+        {
+            PropertyId=propertyId;
+            Name=name;
+            Condition=condition;
+        }
+        public bool ShouldSendTo(uint ownerConnectionId,uint recipientConnectionId)
+        {
+            bool isOwner=ownerConnectionId!=0&&ownerConnectionId==recipientConnectionId;
+            switch (Condition)
+            {
+                case ReplicationCondition.Everyone:
+                return true;
+                case ReplicationCondition.OwnerOnly:
+                return isOwner;
+                case ReplicationCondition.SkipOwner:
+                return !isOwner;
+                default:
+                return false;
+            }
+        }
     }
     public sealed class RepProperty<T> : RepProperty
     {
@@ -26,13 +55,15 @@ namespace UeNet
         private Func<ObjectStateData,T>readState;
         private Action<ObjectStateData,T>writeState;
         private Func<T,T,bool>valuesEqual;
+        
         public RepProperty(ushort propertyId,
             string name,
             Func<NetworkObject, T> readObject,
             Action<NetworkObject, T> writeObject,
             Func<ObjectStateData, T> readState,
             Action<ObjectStateData, T> writeState,
-            Func<T, T, bool> valuesEqual = null):base(propertyId,name)
+            Func<T, T, bool> valuesEqual = null,
+            ReplicationCondition condition=ReplicationCondition.Everyone):base(propertyId,name,condition)
         {
             this.readObject = readObject;
             this.writeObject = writeObject;

@@ -30,6 +30,12 @@ public class RpcCallData
     public List<uint>ObjectReferenceIds;
 }
 [Serializable]
+public class DelayRpcTestArgs
+{
+    public int Order;
+    public uint ReferenceId;
+}
+[Serializable]
 public class HitRpcArgs
 {
     public int Damage;

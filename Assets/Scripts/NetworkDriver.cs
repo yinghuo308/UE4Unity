@@ -42,6 +42,42 @@ namespace UeNet
         }
         void Awake()
         {
+            RpcRegistry.Register(201, (target, argsJson) =>
+            {
+                if (target == null || target.IsServerObject)
+                    return;
+                DelayRpcTestArgs args;
+                try
+                {
+                    args = JsonUtility.FromJson<DelayRpcTestArgs>(
+                        argsJson);
+                }
+                catch (ArgumentException)
+                {
+                    return;
+                }
+                if (args == null)
+                    return;
+                if (args.ReferenceId != 0)
+                {
+                    if (!target.Registry.TryGet(
+                            args.ReferenceId,
+                            out NetworkObject referencedObject) ||
+                        referencedObject == null)
+                    {
+                        Debug.LogError(
+                            $"[延迟测试] RPC 已执行，但依赖对象不存在：" +
+                            $"Order={args.Order}, B={args.ReferenceId}",
+                            target);
+                        return;
+                    }
+                }
+                Debug.Log(
+                    $"[延迟测试] 执行 RPC：Order={args.Order}, " +
+                    $"A={target.NetObjectId}, " +
+                    $"引用编号={args.ReferenceId}",
+                    target);
+            });
              RpcRegistry.Register(1, (target, argsJson) =>
             {
                 HitRpcArgs args;
@@ -100,6 +136,7 @@ namespace UeNet
                 $"攻击成功：attacker={attacker.NetObjectId}, " +
                 $"target={victim.NetObjectId}, Health={victim.Health}",
                 victim);
+                attacker.PrivateScore+=10;
                 string hitArgsJson=JsonUtility.ToJson(new HitRpcArgs{Damage=damage});
                 foreach (Connection connection in connections.Values)
                 {
@@ -151,6 +188,7 @@ namespace UeNet
                 ReceivePackets();
                 if(isServer)UpdateServer();
                 else UpdateClient();
+                UpdatePendingRpcs();
             }
             catch(Exception e)
             {
@@ -735,6 +773,7 @@ namespace UeNet
         private void SendSpawnObject(Connection connection,NetworkObject networkObject)
         {
             if(networkObject==null)return;
+
             uint objectId = networkObject.NetObjectId;
             // 同一连接，不重复打开同一个对象通道。
             if (connection.ActorChannels.ContainsKey(objectId))
@@ -744,10 +783,8 @@ namespace UeNet
                 ObjectId = networkObject.NetObjectId,
                 ObjectType = "NetworkObject",
                 OwnerConnectId=networkObject.OwnerConnectId,
-                health = networkObject.Health,
                 StateVersion=networkObject.StateVersion,
-                Position=networkObject.transform.position,
-                TargetObjectId=networkObject.TargetObjectId
+                InitialProperties=BuildInitialProperties(connection,networkObject)
             };
             NetBunch bunch=new NetBunch
             {
@@ -989,12 +1026,17 @@ namespace UeNet
                 foreach(Connection connection in connections.Values)
                 {
                     if(connection.connectionState!=ConnectionState.Connected)continue;
-                    if (!connection.ActorChannels.ContainsKey(
-                    update.ObjectId))
+                    if (!connection.ActorChannels.TryGetValue(
+                            update.ObjectId,out ActorChannel channel) ||
+                        channel.State != ActorChannelState.Open)
                     {
                         continue;
                     }
-                    connection.Replication.Merge(update);
+                    ObjectUpdateData filtered=FilterForConnection(connection,networkObject,update);
+                    if (filtered.Properties.Count > 0)
+                    {
+                        connection.Replication.Merge(filtered);
+                    }
                 }
             }
             foreach(Connection connection in connections.Values)
@@ -1148,7 +1190,7 @@ namespace UeNet
             {
                 return;
             }
-            if (!channel.ReceiveRpc(call,networkObjectRegistry))
+            if (!channel.ReceiveRpc(call,networkObjectRegistry,Now,allowUnmappedDelay:!isServer))
             {
                 Debug.LogWarning(
                     $"RPC 未执行：ObjectId={bunch.ObjectId}, RpcId={call.RpcId}",
@@ -1173,7 +1215,8 @@ namespace UeNet
             }
             if (spawnData == null ||
                 spawnData.ObjectId != bunch.ObjectId ||
-                spawnData.ObjectType != "NetworkObject")
+                spawnData.ObjectType != "NetworkObject"||
+                spawnData.InitialProperties==null)
             {
                 return;
             }
@@ -1199,21 +1242,28 @@ namespace UeNet
                     $"{name}_NetworkObject_{bunch.ObjectId}");
                 networkObject =
                     instance.AddComponent<NetworkObject>();
-                networkObject.Health = spawnData.health;
                 networkObject.StateVersion =
                     spawnData.StateVersion;
-                networkObject.transform.position =
-                    spawnData.Position;
                 networkObjectRegistry.RegisterClientObject(
                     networkObject,
                     bunch.ObjectId);
             }
-            // Bind 内部创建客户端复制器，
-            // 并应用在 Open 之前收到的属性更新。
             networkObject.OwnerConnectId=spawnData.OwnerConnectId;
-            networkObject.ApplyTargetId(spawnData.TargetObjectId);
+            foreach(PropertyUpdateData item in spawnData.InitialProperties)
+            {
+                if(item==null)continue;
+                if(!RepLayout.Instance.TryGetProperty(item.PropertyId,out RepProperty property))
+                {
+                    continue;
+                }
+                var decoded=new ObjectStateData();
+                if (!property.TryReadUpdate(item, decoded))
+                {
+                    continue;
+                }
+                property.Apply(networkObject,decoded);
+            }
             channel.Bind(networkObject);
-            ResolvePendingRpcs(connection);
             if (networkObject.OwnerConnectId != 0 &&
                 networkObject.OwnerConnectId == connection.connectionID)
             {
@@ -1314,7 +1364,7 @@ namespace UeNet
             if(!isServer)networkObjectRegistry.Clear();
         }        
         private void SendClientRpc(Connection connection,uint objectId,
-                            ushort rpcId,string argsJson)
+                            ushort rpcId,string argsJson,params uint[] objectReferenceIds)
         {
             if(!isServer||connection.connectionState!=ConnectionState.Connected
                 ||!connection.ActorChannels.TryGetValue(objectId,
@@ -1326,7 +1376,8 @@ namespace UeNet
             {
                 RpcId=rpcId,
                 Direction=RpcDirection.Client,
-                ArgsJson=argsJson??string.Empty
+                ArgsJson=argsJson??string.Empty,
+                ObjectReferenceIds=objectReferenceIds==null?null:new List<uint>(objectReferenceIds)
             };
             var bunch=new NetBunch
             {
@@ -1379,6 +1430,7 @@ namespace UeNet
             NetworkObject player =
                 instance.AddComponent<NetworkObject>();
             player.Health = 100;
+            player.PrivateScore=1000;
             // 注册服务器对象，分配网络对象编号。
             networkObjectRegistry.RegisterServerObject(player);
             // 指定这个对象由哪个客户端控制。
@@ -1459,14 +1511,71 @@ namespace UeNet
                 // 失败时保留编号，下次再尝试。
             }
         }
-        private void ResolvePendingRpcs(Connection connection)
+        private void UpdatePendingRpcs()
         {
-            if(connection==null)return;
-            foreach(ActorChannel channel in connection.ActorChannels.Values)
+            if(isServer)return;
+            Connection connection=serverConnection;
+            if (connection == null || connection.connectionState != ConnectionState.Connected)
             {
-                int executed=channel.ResolvePendingRpc(networkObjectRegistry);
-                if(executed>0)Debug.Log($"执行了{executed}条延迟RPC",this);
+                return;
             }
+            double now=Now;
+            var channels=new List<ActorChannel>(connection.ActorChannels.Values);
+            foreach(ActorChannel channel in channels)
+            {
+                if(connection.connectionState!=ConnectionState.Connected)break;
+                channel.ResolvePendingRpc(networkObjectRegistry,now);
+            }
+        }
+        private List<PropertyUpdateData> BuildInitialProperties(Connection recipient,NetworkObject obj)
+        {
+            RepLayout layout=RepLayout.Instance;
+            ObjectStateData snapshot=layout.Capture(obj);
+            var result=new List<PropertyUpdateData>();
+            foreach(RepProperty property in layout.Properties)
+            {
+                if (!property.ShouldSendTo(obj.OwnerConnectId, recipient.connectionID))
+                {
+                    continue;
+                }
+                result.Add(property.CreateUpdate(snapshot,obj.StateVersion));
+            }
+            return result;
+        }
+        private ObjectUpdateData FilterForConnection(
+            Connection recipient,
+            NetworkObject obj,
+            ObjectUpdateData update)
+        {
+            var result = new ObjectUpdateData
+            {
+                ObjectId = update.ObjectId
+            };
+            foreach (PropertyUpdateData item in update.Properties)
+            {
+                if (item == null)
+                    continue;
+                if (!RepLayout.Instance.TryGetProperty(
+                        item.PropertyId,
+                        out RepProperty property))
+                {
+                    continue;
+                }
+                if (!property.ShouldSendTo(
+                        obj.OwnerConnectId,
+                        recipient.connectionID))
+                {
+                    continue;
+                }
+                result.Properties.Add(new PropertyUpdateData
+                {
+                    PropertyId = item.PropertyId,
+                    PropertyVersion = item.PropertyVersion,
+                    ValueJson = item.ValueJson
+                });
+            }
+
+            return result;
         }
     }
 

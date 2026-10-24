@@ -14,8 +14,11 @@ namespace UeNet
             properties=new RepProperty[]
             {
                 new RepProperty<int>(
-                    propertyId:1,name:"Health",readObject:obj=>obj.Health,writeObject:(obj,value)=>obj.Health=value,
-                    readState:state=>state.Health,writeState:(state,value)=>state.Health=value
+                    propertyId:1,name:"Health",
+                    readObject:obj=>obj.Health,
+                    writeObject:(obj,value)=>obj.ApplyReplicatedHealth(value),
+                    readState:state=>state.Health,
+                    writeState:(state,value)=>state.Health=value
                 ),
                  new RepProperty<Vector3>(
                     propertyId: 2,
@@ -38,6 +41,19 @@ namespace UeNet
                     writeObject:(obj,value)=>obj.ApplyTargetId(value),
                     readState:state=>state.TargetObjectId,
                     writeState:(state,value)=>state.TargetObjectId=value
+                ),
+                new RepProperty<int>(
+                    propertyId:4,
+                    name:"PrivateScore",
+                    readObject:obj=>obj.PrivateScore,
+                    writeObject: (obj, value) =>
+                    {
+                        if(obj.PrivateScore==value)return;
+                        obj.PrivateScore=value;
+                    },
+                    readState:state=>state.PrivateScore,
+                    writeState:(state,value)=>state.PrivateScore=value,
+                    condition:RepProperty.ReplicationCondition.OwnerOnly
                 )
             };
         }

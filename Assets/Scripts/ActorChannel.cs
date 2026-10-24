@@ -16,8 +16,20 @@ public class ActorChannel
     public ActorChannelState State{get;private set;}
     private ObjectReplicator replicator;
     private const int MaxPendingProperties=64;
-    private const int MaxPendingRpc=64;
-    private readonly List<RpcCallData> pendingRpcs=new List<RpcCallData>();
+    private const int MaxPendingRpcs=64;
+    private const double PendingRpcTimeout=5.0;
+    private sealed class PendingRpc
+    {
+        public RpcCallData Call;
+        public double ReceivedTime;
+    }
+    private readonly Queue<PendingRpc>pendingRpcs=new Queue<PendingRpc>();
+    private enum ReferenceState
+    {
+        Ready,
+        Waiting,
+        Removed
+    }
     private readonly Dictionary<ushort,PropertyUpdateData> pendingProperties =
         new Dictionary<ushort, PropertyUpdateData>();
     public ReliableMessageQueue ReliableSender{get;}=new ReliableMessageQueue();
@@ -116,41 +128,122 @@ public class ActorChannel
         pendingProperties.Clear();
         pendingRpcs.Clear();
     }
-    public bool ReceiveRpc(RpcCallData call,NetworkObjectRegistry registry)
+    public bool ReceiveRpc(RpcCallData call,NetworkObjectRegistry registry
+                            ,double now,bool allowUnmappedDelay)
     {
-        if(call==null||State!=ActorChannelState.Open
-                    ||Target==null||registry==null)return false;
-        if(CanResolveReference(call,registry))
-        return RpcRegistry.TryInvoke(call.RpcId,Target,call.ArgsJson);
-        if(pendingRpcs.Count>=MaxPendingRpc)return false;
-        pendingRpcs.Add(call);
+       if(call==null||registry==null||call.RpcId==0||
+            State != ActorChannelState.Open || Target == null)
+        {
+            return false;
+        }
+        if (call.ObjectReferenceIds != null && call.ObjectReferenceIds.Count > 64)
+        {
+            return false;
+        }
+        ReferenceState referenceState=CheckReferences(call,registry);
+        if (!allowUnmappedDelay)
+        {
+            if(referenceState!=ReferenceState.Ready)return false;
+            return RpcRegistry.TryInvoke(call.RpcId,Target,call.ArgsJson);
+        }
+        if (pendingRpcs.Count == 0 && referenceState == ReferenceState.Ready)
+        {
+            return RpcRegistry.TryInvoke(call.RpcId,Target,call.ArgsJson);
+        }
+        if (referenceState == ReferenceState.Removed)
+        {
+             Debug.LogWarning(
+            $"丢弃 RPC：ObjectId={ObjectId}, " +
+            $"RpcId={call.RpcId}，引用对象已经销毁。");
+            return false;
+        }
+        if (pendingRpcs.Count >= MaxPendingRpcs)
+        {
+            throw new System.InvalidOperationException(
+                $"对象 {ObjectId} 的延迟 RPC 队列已满。");
+        }
+        var copy = new RpcCallData
+        {
+            RpcId = call.RpcId,
+            Direction = call.Direction,
+            ArgsJson = call.ArgsJson,
+            ObjectReferenceIds =
+                call.ObjectReferenceIds == null
+                    ? null
+                    : new List<uint>(
+                        call.ObjectReferenceIds)
+        };
+        pendingRpcs.Enqueue(new PendingRpc
+        {
+            Call = copy,
+            ReceivedTime = now
+        });
+        Debug.Log(
+        $"[延迟测试] RPC 入队：" +
+        $"A={ObjectId}, RpcId={call.RpcId}, " +
+        $"依赖状态={referenceState}, " +
+        $"队列数量={pendingRpcs.Count}",
+        Target);
         return true;
     }
-    private static bool CanResolveReference(RpcCallData call,NetworkObjectRegistry registry)
+    private static ReferenceState CheckReferences(RpcCallData call,NetworkObjectRegistry registry)
     {
-        if(call.ObjectReferenceIds==null)return true;
+        if(call.ObjectReferenceIds==null)return ReferenceState.Ready;
+        bool waiting=false;
         foreach(uint objectId in call.ObjectReferenceIds)
         {
             if(objectId==0)continue;
-            if(!registry.TryGet(objectId,out NetworkObject target)||target==null)
+            if(registry.IsRemoved(objectId))return ReferenceState.Removed;
+            if(!registry.TryGet(objectId,out NetworkObject referenceObject) || referenceObject == null)
             {
-                return false;
+                waiting=true;
             }
         }
-        return true;
+        return waiting?ReferenceState.Waiting:ReferenceState.Ready;
     }
-    public int ResolvePendingRpc(NetworkObjectRegistry registry)
+    public int ResolvePendingRpc(NetworkObjectRegistry registry,double now)
     {
         if(registry==null)return 0;
+        if(State!=ActorChannelState.Open||Target==null)
+        {
+            pendingRpcs.Clear();
+            return 0;
+        }
         int excuted=0;
         while (pendingRpcs.Count > 0)
         {
-            RpcCallData call=pendingRpcs[0];
-            if(!CanResolveReference(call,registry))break;
-            pendingRpcs.RemoveAt(0);
-            if (Target != null && RpcRegistry.TryInvoke(call.RpcId, Target, call.ArgsJson))
+            if (State != ActorChannelState.Open || Target == null)
+            {
+                pendingRpcs.Clear();
+                break;
+            }
+            PendingRpc pending=pendingRpcs.Peek();
+            RpcCallData call=pending.Call;
+            ReferenceState referenceState=CheckReferences(call,registry);
+            bool expired=referenceState == ReferenceState.Waiting &&now-pending.ReceivedTime>=PendingRpcTimeout;
+            if (referenceState == ReferenceState.Removed || expired)
+            {
+                pendingRpcs.Dequeue();
+                string reason =
+                referenceState == ReferenceState.Removed
+                    ? "引用对象已经销毁"
+                    : "等待超时";
+                Debug.LogWarning(
+                    $"丢弃延迟 RPC：ObjectId={ObjectId}, " +
+                    $"RpcId={call.RpcId}，{reason}。");
+                continue;
+            }
+            if(referenceState==ReferenceState.Waiting)break;
+            pendingRpcs.Dequeue();
+            if (RpcRegistry.TryInvoke(call.RpcId, Target, call.ArgsJson))
             {
                 excuted++;
+            }
+            else
+            {
+                Debug.LogWarning(
+                $"延迟 RPC 找不到处理器：" +
+                $"ObjectId={ObjectId}, RpcId={call.RpcId}");
             }
         }
         return excuted;

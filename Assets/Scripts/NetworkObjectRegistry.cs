@@ -109,8 +109,12 @@ namespace UeNet
                     "引用所属对象不在当前注册表中。");
             }
             RemoveReference(owner.NetObjectId,owner.TargetObjectId);
-            owner.SetResolvedTarget(0,null);
-            if(targetId==0||removedIds.Contains(targetId))return;
+             if (targetId == 0 ||
+                removedIds.Contains(targetId))
+            {
+                owner.SetResolvedTarget(0, null);
+                return;
+            }
             if(!references.TryGetValue(targetId,out HashSet<uint> owners))
             {
                 owners=new HashSet<uint>();
@@ -159,6 +163,10 @@ namespace UeNet
                     targetId,
                     resolved);
             }
+        }
+        public bool IsRemoved(uint objectId)
+        {
+            return removedIds.Contains(objectId);
         }
         public void Clear()
         {
