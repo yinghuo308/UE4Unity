@@ -25,6 +25,7 @@ namespace UeNet
             public string ObjectType;
             public uint OwnerConnectId;
             public uint StateVersion;
+            public InventoryStateData Inventory;
             public List<PropertyUpdateData> InitialProperties=new List<PropertyUpdateData>();
         }
     [Serializable]

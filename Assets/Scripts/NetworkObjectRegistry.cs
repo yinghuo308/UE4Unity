@@ -63,8 +63,9 @@ namespace UeNet
         {
             return objects.TryGetValue(objectId,out networkObject);
         }
-        public void Remove(uint objectId)
+        public void Remove(uint objectId,bool permanently=true)
         {
+            if(permanently)
             removedIds.Add(objectId);
             if(objects.TryGetValue(objectId,out NetworkObject removed)&&
                         removed != null)

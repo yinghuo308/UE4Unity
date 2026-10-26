@@ -7,7 +7,11 @@ public enum NetBunchType
     Open = 1,
     Properties = 2,
     Close = 3,
-    Rpc=4
+    Rpc=4,
+    SubobjectProperties=5,
+    SubobjectCreate=6,
+    SubobjectDestroy=7,
+    SubobjectItemProperties=8
 }
 public enum RpcDirection
 {
@@ -20,6 +24,10 @@ public sealed class NetBunch
     public uint ObjectId;
     public NetBunchType Type;
     public string PayloadJson;
+
+    // Close Bunch 的语义：true 表示对象永久销毁，false 表示暂时离开相关范围。
+    // 旧格式没有这个字段时，JsonUtility 会得到 false，兼容临时关闭。
+    public bool DestroyObject;
 }
 [Serializable]
 public class RpcCallData

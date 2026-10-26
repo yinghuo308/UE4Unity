@@ -39,6 +39,9 @@ namespace UeNet
         private NetworkObject previousTarget;
         private uint previousTargetId;
         public int PrivateScore;
+        public InventoryComponent Inventory{get;internal set;}
+        private uint nextSubobjectId=2;
+        internal readonly Dictionary<uint,ReplicatedItemData>ReplicatedItems=new Dictionary<uint, ReplicatedItemData>();
          internal void ApplyTargetId(uint objectId)
         {
             if (Registry == null)
@@ -115,6 +118,24 @@ namespace UeNet
         {
             HealthChanged?.Invoke(oldHealth,newHealth);
         }
+        public uint AllocatedSubobjectId()
+        {
+            if (!IsServerObject)
+            {
+                throw new InvalidOperationException(
+                    "只有服务器可以分配子对象编号。");
+            }
+            if (nextSubobjectId == 0)
+            {
+                throw new InvalidOperationException(
+                    "子对象编号已经耗尽。");
+            }
+            uint id = nextSubobjectId;
+            nextSubobjectId =
+                unchecked(nextSubobjectId + 1);
+            return id;
+        }
+        
     }
 }
 

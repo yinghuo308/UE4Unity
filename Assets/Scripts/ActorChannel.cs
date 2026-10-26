@@ -1,3 +1,4 @@
+using System;
 using System.Collections;
 using System.Collections.Generic;
 using UeNet;
@@ -34,6 +35,9 @@ public class ActorChannel
         new Dictionary<ushort, PropertyUpdateData>();
     public ReliableMessageQueue ReliableSender{get;}=new ReliableMessageQueue();
     public ReliableReceiveBuffer ReliableReceiver{get;}=new ReliableReceiveBuffer();
+    private readonly Dictionary<uint,InventoryReplicator>inventoryReplicators=new Dictionary<uint, InventoryReplicator>();
+    private readonly Dictionary<uint,ReplicatedItemView>itemViews=new Dictionary<uint, ReplicatedItemView>();
+    private readonly Dictionary<uint,ItemReplicator> itemReplicators=new Dictionary<uint, ItemReplicator>();
     public ActorChannel(uint objectId)
     {
         ObjectId = objectId;
@@ -49,6 +53,20 @@ public class ActorChannel
         Target = target;
         replicator = new ObjectReplicator(target);
         State = ActorChannelState.Open;
+        inventoryReplicators.Clear();
+        if (target.IsServerObject)
+        {
+             foreach (ReplicatedItemData item
+                    in target.ReplicatedItems.Values)
+            {
+                itemReplicators[item.SubobjectId] =
+                    new ItemReplicator(item);
+            }
+        }
+        if (target.Inventory != null)
+        {
+            inventoryReplicators.Add(target.Inventory.SubobjectId,new InventoryReplicator(target.Inventory));
+        }
         if(pendingProperties.Count==0)return;
         var update=new ObjectUpdateData
         {
@@ -105,11 +123,14 @@ public class ActorChannel
     }
     public void Close()
     {
+        ClearItemViews();
         State = ActorChannelState.Closed;
         Target = null;
         replicator = null;
         pendingProperties.Clear();
         pendingRpcs.Clear();
+        inventoryReplicators.Clear();
+        itemReplicators.Clear();
     }
     public uint QueueReliableBunch(uint connectionId,NetBunch bunch)
     {
@@ -122,11 +143,25 @@ public class ActorChannel
     }
     public void BeginClose()
     {
+        ClearItemViews();
         State=ActorChannelState.Closing;
         Target=null;
         replicator=null;
         pendingProperties.Clear();
         pendingRpcs.Clear();
+        inventoryReplicators.Clear();
+        itemReplicators.Clear();
+    }
+    private void ClearItemViews()
+    {
+        foreach(ReplicatedItemView view in itemViews.Values)
+        {
+            if (view != null)
+            {
+                UnityEngine.GameObject.Destroy(view.gameObject);
+            }
+        }
+        itemViews.Clear();
     }
     public bool ReceiveRpc(RpcCallData call,NetworkObjectRegistry registry
                             ,double now,bool allowUnmappedDelay)
@@ -247,5 +282,217 @@ public class ActorChannel
             }
         }
         return excuted;
+    }
+    public void QueueInventoryUpdates(uint connectionId)
+    {
+        if(State!=ActorChannelState.Open||Target==null||!Target.IsServerObject)return;
+        foreach(InventoryReplicator inventoryReplicator in inventoryReplicators.Values)
+        {
+            if(!inventoryReplicator.TryBuildUpdate(out InventoryStateData update))
+            {
+                continue;
+            }
+            var bunch=new NetBunch
+            {
+                ObjectId=ObjectId,
+                Type=NetBunchType.SubobjectProperties,
+                PayloadJson=JsonUtility.ToJson(update)
+            };
+            QueueReliableBunch(connectionId,bunch);
+            inventoryReplicator.CommitQueued(update);
+        }
+    }
+    public bool ReceiveInventoryProperties(InventoryStateData update)
+    {
+        if(State!=ActorChannelState.Open||Target==null||Target.IsServerObject||
+                update==null||update.PlayerObjectId!=ObjectId)
+        return false;
+        if(!inventoryReplicators.TryGetValue(update.SubobjectId,out InventoryReplicator inventoryReplicator))
+        {
+            return false;
+        }
+        return inventoryReplicator.ApplyUpdate(update);        
+    }
+    public bool ReceiveSubobjectCreate(string json)
+    {
+        if (State != ActorChannelState.Open ||
+        Target == null ||
+        Target.IsServerObject)
+        {
+            return false;
+        }
+        ReplicatedItemData item;
+        try
+        {
+            item =
+                JsonUtility.FromJson<ReplicatedItemData>(
+                    json);
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+        if (item == null ||
+            item.SubobjectId == 0 ||
+            item.ItemTypeId <= 0 ||
+            item.Count <= 0)
+        {
+            return false;
+        }
+        // 重复创建消息不重复添加。
+        if (Target.ReplicatedItems.ContainsKey(
+                item.SubobjectId))
+        {
+            return true;
+        }
+          Target.ReplicatedItems.Add(
+        item.SubobjectId,
+        item);
+        CreateItemView(item);
+        Debug.Log(
+            $"[子对象创建] ObjectId={ObjectId}, " +
+            $"SubobjectId={item.SubobjectId}, " +
+            $"ItemTypeId={item.ItemTypeId}, " +
+            $"Count={item.Count}");
+        return true;
+    }
+    public bool ReceiveSubobjectDestroy(string json)
+    {
+        if (State != ActorChannelState.Open ||
+            Target == null ||
+            Target.IsServerObject)
+        {
+            return false;
+        }
+        SubobjectDestroyData data;
+        try
+        {
+            data =
+                JsonUtility.FromJson<SubobjectDestroyData>(
+                    json);
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+        if (data == null || data.SubobjectId == 0)
+            return false;
+        bool removed = Target.ReplicatedItems.Remove(
+            data.SubobjectId);
+            if (itemViews.TryGetValue(data.SubobjectId,out ReplicatedItemView view))
+        {
+            if (view != null)
+            {
+                UnityEngine.Object.Destroy(
+                    view.gameObject);
+            }
+            itemViews.Remove(data.SubobjectId);
+        }
+        if (removed)
+        {
+            Debug.Log(
+                $"[子对象销毁] ObjectId={ObjectId}, " +
+                $"SubobjectId={data.SubobjectId}");
+        }
+        // 已经不存在，也符合删除后的目标状态。
+        return true;
+    }
+    public bool ReceiveSubobjectItemProperties(string json)
+    {
+        if(State!=ActorChannelState.Open||Target==null||Target.IsServerObject)return false;
+        ReplicatedItemData update;
+        try
+        {
+            update=JsonUtility.FromJson<ReplicatedItemData>(json);
+        }
+        catch
+        {
+            return false;
+        }
+        if(update==null||update.SubobjectId==0||
+                !Target.ReplicatedItems.TryGetValue(update.SubobjectId,out ReplicatedItemData current))
+        {
+            return false;
+        }
+        if (!ObjectReplicator.IsNewerVersion(update.StateVersion, current.StateVersion))
+        {
+            return false;
+        }
+        current.ItemTypeId=update.ItemTypeId;
+        current.Count=update.Count;
+        current.StateVersion=update.StateVersion;
+        if (itemViews.TryGetValue(update.SubobjectId,out ReplicatedItemView view) &&
+            view != null)
+        {
+            view.Apply(current);
+        }
+        Debug.Log(
+        $"[动态物品同步] ObjectId={ObjectId}, " +
+        $"SubobjectId={update.SubobjectId}, " +
+        $"Count={update.Count}");
+        return true;
+    }
+    public ReplicatedItemView CreateItemView(ReplicatedItemData item)
+    {
+        if(item==null||Target==null)return null;
+        GameObject prefab=Resources.Load<GameObject>($"NetworkItems/{item.ItemTypeId}");
+        if (prefab == null)
+        {
+             Debug.LogWarning(
+            $"找不到物品预制体：" +
+            $"ItemTypeId={item.ItemTypeId}");
+            return null;
+        }
+        GameObject instance=UnityEngine.Object.Instantiate(prefab,Target.transform);
+         instance.name =$"Item_{item.SubobjectId}";
+        ReplicatedItemView view =instance.GetComponent<ReplicatedItemView>();       
+        if (view == null)
+        {
+            view =instance.AddComponent<ReplicatedItemView>();
+        }
+        view.Initialize(item);
+        itemViews[item.SubobjectId] = view;
+        return view;
+    }
+    public void RegisterItemForReplication(
+            ReplicatedItemData item)
+    {
+        if (State != ActorChannelState.Open ||
+                Target == null ||
+                !Target.IsServerObject ||
+                item == null ||
+                item.SubobjectId == 0)
+        {
+            return;
+        }
+
+        itemReplicators[item.SubobjectId] =new ItemReplicator(item);
+    }
+    public void UnregisterItemForReplication(
+        uint subobjectId)
+    {
+        itemReplicators.Remove(subobjectId);
+    }
+    public void QueueItemUpdates(uint connectionId)
+    {
+        if (State != ActorChannelState.Open || Target == null || !Target.IsServerObject)
+        {
+            return;
+        }
+        foreach(ItemReplicator itemReplicator in itemReplicators.Values)
+        {
+            if(!itemReplicator.TryBuildUpdate(out ReplicatedItemData update))
+            {
+                continue;
+            }
+            var bunch=new NetBunch
+            {
+                ObjectId=ObjectId,
+                Type=NetBunchType.SubobjectItemProperties,
+                PayloadJson=JsonUtility.ToJson(update)
+            };
+            QueueReliableBunch(connectionId,bunch);
+            itemReplicator.CommitQueued(update);
+        }
     }
 }

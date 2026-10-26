@@ -29,12 +29,118 @@ namespace UeNet
         private const double StateSyncInterval=0.1;
        //private readonly Dictionary<uint,Dictionary<ushort,PropertyUpdateData>> pendingObjectStates=
                         // Dictionary<uint, Dictionary<ushort, PropertyUpdateData>>();
+        private const float RelevancyDistance=20f;
         private double nextStateSyncTime;
         [SerializeField]private uint testDespawnObjectId=1;
         [SerializeField]private uint testRpcObjectId=1;
         [SerializeField]private uint testAttackTargetObject=2;
+        [SerializeField]private uint testSubobjectId;
+        private readonly Dictionary<uint, List<uint>> testCreatedSubobjectIds =
+        new Dictionary<uint, List<uint>>();
         private uint localPlayerObjectId;
         private readonly Dictionary<uint,ObjectReplicator> objectReplicators=new Dictionary<uint, ObjectReplicator>();
+        [ContextMenu("测试创建动态子对象")]
+        private void TestCreateSubobject()
+        {
+            if (!isServer)
+            {
+                Debug.LogWarning("请在服务器上执行。", this);
+                return;
+            }
+
+            if (testRpcObjectId == 0)
+            {
+                Debug.LogWarning(
+                    "请先设置 testRpcObjectId。",
+                    this);
+                return;
+            }
+
+            uint subobjectId =
+                ServerCreateItem(
+                    testRpcObjectId,
+                    1001,
+                    1);
+
+            if (subobjectId == 0)
+            {
+                Debug.LogWarning(
+                    "动态子对象创建失败。",
+                    this);
+                return;
+            }
+
+           if (!testCreatedSubobjectIds.TryGetValue(
+                    testRpcObjectId,
+                    out List<uint> itemIds))
+            {
+                itemIds = new List<uint>();
+
+                testCreatedSubobjectIds.Add(
+                    testRpcObjectId,
+                    itemIds);
+            }
+
+            itemIds.Add(subobjectId);
+
+            Debug.Log(
+                $"服务器创建动态子对象：" +
+                $"OwnerObjectId={testRpcObjectId}, " +
+                $"SubobjectId={subobjectId}",
+                this);
+        }
+        [ContextMenu("测试销毁动态子对象")]
+        private void TestDestroySubobject()
+        {
+            
+        if (!isServer)
+        {
+            Debug.LogWarning("请在服务器上执行。", this);
+            return;
+        }
+        if (testRpcObjectId == 0 ||
+            testSubobjectId == 0)
+        {
+            Debug.LogWarning(
+                "请在 Inspector 填写 testRpcObjectId 和 testSubobjectId。",
+                this);
+            return;
+        }
+        if (!ServerDestroyItem(
+                testRpcObjectId,
+                testSubobjectId))
+        {
+            Debug.LogWarning(
+                $"动态子对象销毁失败：" +
+                $"OwnerObjectId={testRpcObjectId}, " +
+                $"SubobjectId={testSubobjectId}",
+                this);
+            return;
+        }
+        if (testCreatedSubobjectIds.TryGetValue(
+                testRpcObjectId,
+                out List<uint> itemIds))
+        {
+            itemIds.Remove(testSubobjectId);
+
+            if (itemIds.Count == 0)
+            {
+                testCreatedSubobjectIds.Remove(
+                    testRpcObjectId);
+            }
+        }
+        Debug.Log(
+            $"服务器销毁动态子对象：" +
+            $"OwnerObjectId={testRpcObjectId}, " +
+            $"SubobjectId={testSubobjectId}",
+            this);
+        }
+        
+        [ContextMenu("动态物品数量变化同步测试")]
+        private void UpdateServerReplication()
+        {
+            ServerSetItemCount(testRpcObjectId,2,10);
+        }
         [ContextMenu("测试服务器销毁")]
         public void DespawnTestObject()
         {
@@ -487,6 +593,13 @@ namespace UeNet
             {
                 nextStateSyncTime=now+StateSyncInterval;
                 ProcessPendingPlayerDespawns();
+                foreach(Connection connection in connections.Values)
+                {
+                    if (connection.connectionState == ConnectionState.Connected)
+                    {
+                        UpdateActorRelevancy(connection);
+                    }
+                }
                 BroadcastObjectStates();
             }
         }
@@ -784,7 +897,8 @@ namespace UeNet
                 ObjectType = "NetworkObject",
                 OwnerConnectId=networkObject.OwnerConnectId,
                 StateVersion=networkObject.StateVersion,
-                InitialProperties=BuildInitialProperties(connection,networkObject)
+                InitialProperties=BuildInitialProperties(connection,networkObject),
+                Inventory=networkObject.Inventory!=null?InventoryRepLayout.Capture(networkObject.Inventory):null
             };
             NetBunch bunch=new NetBunch
             {
@@ -796,6 +910,14 @@ namespace UeNet
             channel.Bind(networkObject);
             connection.ActorChannels.Add(objectId,channel);
             QueueReliableBunch(connection,bunch);
+            foreach (ReplicatedItemData item
+                    in networkObject.ReplicatedItems.Values)
+            {
+                SendItemCreate(
+                    connection,
+                    networkObject.NetObjectId,
+                    item);
+            }
         }
         private void QueueInitialObjects(Connection connection)
         {
@@ -805,7 +927,7 @@ namespace UeNet
             foreach (NetworkObject networkObject
                     in networkObjectRegistry.GetAllObject())
             {
-                if (networkObject == null)
+                if (networkObject == null||!IsActorRelevant(connection,networkObject))
                     continue;
                 SendSpawnObject(connection, networkObject);
             }
@@ -1026,6 +1148,7 @@ namespace UeNet
                 foreach(Connection connection in connections.Values)
                 {
                     if(connection.connectionState!=ConnectionState.Connected)continue;
+                    if(!IsActorRelevant(connection,networkObject))continue;
                     if (!connection.ActorChannels.TryGetValue(
                             update.ObjectId,out ActorChannel channel) ||
                         channel.State != ActorChannelState.Open)
@@ -1042,6 +1165,13 @@ namespace UeNet
             foreach(Connection connection in connections.Values)
             {
                 if(connection.connectionState!=ConnectionState.Connected)continue;
+                 foreach (ActorChannel channel
+                        in connection.ActorChannels.Values)
+                {
+                    channel.QueueInventoryUpdates(
+                        connection.connectionID);
+                    channel.QueueItemUpdates(connection.connectionID);
+                }
                 FlushPropertyUpdates(connection,now);
             }   
         }
@@ -1149,11 +1279,63 @@ namespace UeNet
                     HandleChannelProperties(connection, bunch);
                     break;
                 case NetBunchType.Close:
-                    HandleChannelClose(connection, bunch.ObjectId);
+                    HandleChannelClose(
+                        connection,
+                        bunch.ObjectId,
+                        bunch.DestroyObject);
                     break;
                 case NetBunchType.Rpc:
                     HandleChannelRpc(connection,bunch);
                     break;
+                case NetBunchType.SubobjectProperties:
+                    HandleInventoryProperties(connection,bunch);
+                    break;
+                case NetBunchType.SubobjectCreate:
+                     {
+                    if (!connection.ActorChannels.TryGetValue(
+                            bunch.ObjectId,
+                            out ActorChannel channel) ||
+                        channel == null)
+                            {
+                                Debug.LogWarning(
+                                    $"找不到子对象所属通道：" +
+                                    $"ObjectId={bunch.ObjectId}",
+                                    this);
+                                break;
+                            }
+                    channel.ReceiveSubobjectCreate(
+                        bunch.PayloadJson);
+                        break;
+                    }
+                case NetBunchType.SubobjectDestroy:
+                    {
+                        if (!connection.ActorChannels.TryGetValue(
+                                bunch.ObjectId,
+                                out ActorChannel channel) ||
+                            channel == null)
+                        {
+                            Debug.LogWarning(
+                                $"找不到子对象所属通道：" +
+                                $"ObjectId={bunch.ObjectId}",
+                                this);
+                            break;
+                        }
+                        channel.ReceiveSubobjectDestroy(
+                            bunch.PayloadJson);
+                        break;
+                    }
+                case NetBunchType.SubobjectItemProperties:
+                    {
+                        if (!connection.ActorChannels.TryGetValue(
+                                bunch.ObjectId,
+                                out ActorChannel channel) ||
+                            channel == null)
+                        {
+                            break;
+                        }
+                        channel.ReceiveSubobjectItemProperties(bunch.PayloadJson);
+                        break;
+                    }    
             }
         }
 
@@ -1220,6 +1402,17 @@ namespace UeNet
             {
                 return;
             }
+            if (spawnData.Inventory != null)
+            {
+                if (!InventoryRepLayout.IsValid(
+                        spawnData.Inventory) ||
+                    spawnData.Inventory.PlayerObjectId !=
+                        bunch.ObjectId ||
+                    spawnData.Inventory.SubobjectId != 1)
+                {
+                    return;
+                }
+            }
             if (!connection.ActorChannels.TryGetValue(
                     bunch.ObjectId,
                     out ActorChannel channel))
@@ -1262,6 +1455,19 @@ namespace UeNet
                     continue;
                 }
                 property.Apply(networkObject,decoded);
+            }
+            if (spawnData.Inventory != null)
+            {
+                InventoryComponent inventory =
+                    networkObject.gameObject
+                        .AddComponent<InventoryComponent>();
+                inventory.Owner = networkObject;
+                inventory.SubobjectId =
+                    spawnData.Inventory.SubobjectId;
+                InventoryRepLayout.Apply(
+                    inventory,
+                    spawnData.Inventory);
+                networkObject.Inventory = inventory;
             }
             channel.Bind(networkObject);
             if (networkObject.OwnerConnectId != 0 &&
@@ -1316,29 +1522,40 @@ namespace UeNet
         }
         private void HandleChannelClose(
             Connection connection,
-            uint objectId)
+            uint objectId,
+            bool destroyObject)
         {
-            if (localPlayerObjectId == objectId)
+
+            if (destroyObject && localPlayerObjectId == objectId)
             {
                 localPlayerObjectId = 0;
             }
-            // 先标记销毁，阻止迟到属性重新建立通道。
-            despawnedObjectIds.Add(objectId);
+            // 只有永久销毁才加入黑名单。相关性关闭后，Actor 还可以重新 Open。
+            if (destroyObject)
+            {
+                despawnedObjectIds.Add(objectId);
+            }
             if (connection.ActorChannels.TryGetValue(
                     objectId,
                     out ActorChannel channel))
             {
                 channel.Close();
-                //connection.ActorChannels.Remove(objectId);
+                connection.ActorChannels.Remove(objectId);
             }
-            networkObjectRegistry.TryGet(
+            if (networkObjectRegistry.TryGet(
                     objectId,
-                    out NetworkObject networkObject);
-                networkObjectRegistry.Remove(objectId);
+                    out NetworkObject networkObject))
+            {
+                networkObjectRegistry.Remove(objectId,permanently:destroyObject);
                 if (networkObject != null)
+                {
                     Destroy(networkObject.gameObject);
+                }
+            }
             Debug.Log(
-                $"关闭通道并销毁对象：ObjectId={objectId}",
+                destroyObject
+                    ? $"关闭通道并销毁对象：ObjectId={objectId}"
+                    : $"关闭不相关 Actor 通道：ObjectId={objectId}",
                 this);
         }
         private void ClearActorChannels(Connection connection)
@@ -1435,6 +1652,13 @@ namespace UeNet
             networkObjectRegistry.RegisterServerObject(player);
             // 指定这个对象由哪个客户端控制。
             player.OwnerConnectId = owner.connectionID;
+            InventoryComponent inventory=instance.AddComponent<InventoryComponent>();
+            inventory.Owner=player;
+            inventory.SubobjectId=1;
+            inventory.StateVersion=0;
+            inventory.Capacity=20;
+            inventory.ItemCount=3;
+            player.Inventory=inventory;
             // 建立“连接 → 玩家对象”的关系。
             owner.PlayerObjectId = player.NetObjectId;
             // 创建服务器属性复制器。
@@ -1577,6 +1801,184 @@ namespace UeNet
 
             return result;
         }
+        private void HandleInventoryProperties(Connection connection,NetBunch bunch)
+        {
+            if(isServer)return ;
+            InventoryStateData update;
+            try
+            {
+                update=JsonUtility.FromJson<InventoryStateData>(bunch.PayloadJson);
+            }
+            catch
+            {
+                return;
+            }
+            if (!InventoryRepLayout.IsValid(update) || update.PlayerObjectId != bunch.ObjectId)
+            {
+                return;
+            }
+            if(!connection.ActorChannels.TryGetValue(bunch.ObjectId,out ActorChannel channel))
+            {
+                return;
+            }
+            channel.ReceiveInventoryProperties(update);
+        }
+        [ContextMenu("测试服务器增加背包物品")]
+        public void TestAddInventoryItem()
+{
+    if (!isServer || transport == null)
+    {
+        Debug.LogWarning(
+            "请在运行中的服务器上执行。",
+            this);
+        return;
+    }
+
+    if (!networkObjectRegistry.TryGet(
+            testRpcObjectId,
+            out NetworkObject player) ||
+        player == null ||
+        player.Inventory == null)
+    {
+        Debug.LogWarning(
+            $"玩家或背包不存在：ObjectId={testRpcObjectId}",
+            this);
+        return;
+    }
+
+    InventoryComponent inventory = player.Inventory;
+
+    if (inventory.ItemCount >= inventory.Capacity)
+    {
+        Debug.LogWarning("背包已满。", inventory);
+        return;
+    }
+
+    inventory.ItemCount++;
+
+    Debug.Log(
+        $"服务器修改背包：" +
+        $"Player={player.NetObjectId}, " +
+        $"ItemCount={inventory.ItemCount}",
+        inventory);
+}
+        private uint ServerCreateItem(uint ownerObjectId,int itemTypeId,int count)
+        {
+            if(!isServer)return 0;
+            if(itemTypeId<=0||count<=0)return 0;
+            if(!networkObjectRegistry.TryGet(ownerObjectId,out NetworkObject owner)
+                    || owner == null || !owner.IsServerObject)
+            {
+                return 0;
+            }
+            var item=new ReplicatedItemData
+            {
+                SubobjectId=owner.AllocatedSubobjectId(),
+                ItemTypeId=itemTypeId,
+                Count=count
+            };
+            owner.ReplicatedItems.Add(item.SubobjectId,item);
+            foreach(Connection connection in connections.Values)
+            {
+                SendItemCreate(connection,ownerObjectId,item);
+            }
+            return item.SubobjectId;
+        }
+
+        private void SendItemCreate(Connection connection, uint ownerObjectId, ReplicatedItemData item)
+        {
+            if(!connection.ActorChannels.TryGetValue(ownerObjectId,out ActorChannel channel))return;
+            var bunch=new NetBunch
+            {
+                ObjectId=ownerObjectId,
+                Type=NetBunchType.SubobjectCreate,
+                PayloadJson=JsonUtility.ToJson(item)
+            };
+            channel.QueueReliableBunch(connection.connectionID,bunch);
+            channel.RegisterItemForReplication(item);
+        }
+        public bool ServerDestroyItem(uint ownerObjectId,uint subobjectId)
+        {
+            if(!isServer)return false;
+            if(!networkObjectRegistry.TryGet(ownerObjectId,out NetworkObject owner)
+                        ||owner==null||!owner.IsServerObject)
+            return false;
+            if(!owner.ReplicatedItems.Remove(subobjectId))return false;
+            string json=JsonUtility.ToJson(new SubobjectDestroyData{SubobjectId=subobjectId});
+            foreach(Connection connection in connections.Values)
+            {
+                if(!connection.ActorChannels.TryGetValue(ownerObjectId,out ActorChannel channel))
+                {
+                    continue;
+                }
+                var bunch=new NetBunch
+                {
+                    ObjectId=ownerObjectId,
+                    Type=NetBunchType.SubobjectDestroy,
+                    PayloadJson=json
+                };
+                channel.QueueReliableBunch(connection.connectionID,bunch);
+                channel.UnregisterItemForReplication(subobjectId);
+            }
+            return true;
+        }
+        public bool ServerSetItemCount(uint ownerObjectId,uint subobjectId,int count)
+        {
+            if(!isServer||count<=0)return false;
+            if(!networkObjectRegistry.TryGet(ownerObjectId,out NetworkObject owner)||
+                    owner==null||!owner.IsServerObject||
+                    !owner.ReplicatedItems.TryGetValue(subobjectId,out ReplicatedItemData item))
+            {
+                return false;
+            }
+            if(item.Count==count)return true;
+            item.Count=count;
+            item.StateVersion=unchecked(item.StateVersion+1);
+            return true;
+        }
+        public bool IsActorRelevant(Connection connection,NetworkObject actor)
+        {
+            if(actor==null)return false;
+            if (actor.OwnerConnectId == connection.connectionID)
+            {
+                return true;
+            }
+            if(!networkObjectRegistry.TryGet(connection.PlayerObjectId,out NetworkObject viewer)
+                    || viewer == null)
+            {
+                return true;
+            }
+            return Vector3.SqrMagnitude(viewer.transform.position-
+            actor.transform.position)<=RelevancyDistance*RelevancyDistance;
+        }
+        private void UpdateActorRelevancy(Connection connection)
+        {
+            foreach(NetworkObject actor in networkObjectRegistry.GetAllObject())
+            {
+                if(actor==null)continue;
+                bool relevant=IsActorRelevant(connection,actor);
+                bool hasChannel=connection.ActorChannels.TryGetValue(actor.NetObjectId,out ActorChannel channel);
+                if (relevant)
+                {
+                    if(!hasChannel)SendSpawnObject(connection,actor);
+                    continue;
+                }
+                if (hasChannel && channel.State == ActorChannelState.Open)
+                {
+                    NetBunch bunch=new NetBunch
+                    {
+                        ObjectId=actor.NetObjectId,
+                        Type=NetBunchType.Close,
+                        PayloadJson=string.Empty,
+                        DestroyObject=false
+                    };
+                    connection.Replication.RemoveObject(actor.NetObjectId);
+                    QueueReliableBunch(connection,bunch);
+                    channel.BeginClose();
+                }
+            }
+        }
+
     }
 
 }
