@@ -16,7 +16,8 @@ namespace UeNet
         SpawnObject=6,
         DespawnObject=7,
         StateUpdate=8,
-        ActorBunch=9
+        ActorBunch=9,
+        FragmentAck=10
     }
     [Serializable]
         public class SpawnData
@@ -28,6 +29,11 @@ namespace UeNet
             public InventoryStateData Inventory;
             public List<PropertyUpdateData> InitialProperties=new List<PropertyUpdateData>();
         }
+    [Serializable]
+    public sealed class FragmentAckData
+    {
+        public uint groupId;
+    }
     [Serializable]
     public class ObjectStateData
     {
@@ -103,10 +109,8 @@ namespace UeNet
             messageId = 0;
             reliable = false;
             data=string.Empty;
-
             if (bytes == null || bytes.Length == 0)
                 return false;
-
             try
             {
                 string json = Encoding.UTF8.GetString(bytes);
@@ -116,7 +120,7 @@ namespace UeNet
                 if (message.Type <
                         (int)NetMessageType.ConnectRequest ||
                     message.Type >
-                        (int)NetMessageType.ActorBunch)
+                        (int)NetMessageType.FragmentAck)
                     return false;
                 type = (NetMessageType)message.Type;
                 connectionId = message.ConnectionId;
@@ -129,6 +133,11 @@ namespace UeNet
                 // 不可靠消息不应该携带 MessageId。
                 if (!reliable && messageId != 0)
                     return false;
+                if (type == NetMessageType.FragmentAck &&
+                    (reliable || connectionId == 0))
+                {
+                    return false;
+                }
                 return true;
                 }
                 catch (ArgumentException)

@@ -13,7 +13,7 @@ namespace UeNet
         private double lastFullRefreshTime;
         private const double FullRefreshInterval=1.0;
         private readonly Dictionary<ushort,uint> appliedVersions=new Dictionary<ushort, uint>();
-        
+        private uint nextServerVersion;
         public ObjectReplicator(NetworkObject target)
         {
             if(target==null)throw new ArgumentException(nameof(target));
@@ -73,9 +73,8 @@ namespace UeNet
         //     // $"Health={state.Health}");
         //      return true;
         // }
-         public bool TryCaptureUpdate(
-            double now,
-            out ObjectUpdateData update)
+         public bool TryCaptureUpdate(double now,
+            out ObjectUpdateData update,bool allowPeriodicRefresh)
         {
             update = null;
             if (target == null)
@@ -91,15 +90,15 @@ namespace UeNet
             ObjectStateData current = layout.Capture(target);
             bool fullRefresh =
                 lastSnapshot == null ||
-                now - lastFullRefreshTime >=
-                    FullRefreshInterval;
+                (now - lastFullRefreshTime >=
+                    FullRefreshInterval&&allowPeriodicRefresh);
             ObjectUpdateData candidate = new ObjectUpdateData
             {
                 ObjectId = target.NetObjectId
             };
 
             uint version =
-                unchecked(target.StateVersion + 1);
+                unchecked(nextServerVersion + 1);
             foreach (RepProperty property in layout.Properties)
             {
                 bool shouldSend =
@@ -112,7 +111,7 @@ namespace UeNet
             }
             if (candidate.Properties.Count == 0)
                 return false;
-            target.StateVersion = version;
+            nextServerVersion = version;
             if (lastSnapshot == null)
             {
                 lastSnapshot = new ObjectStateData
@@ -166,6 +165,13 @@ namespace UeNet
                 applied=true;
             }
             return applied;
+        }
+        public void InitializeServerBaseline(double now)
+        {
+            if(target==null||!target.IsServerObject)return;
+            lastSnapshot=layout.Capture(target);
+            lastFullRefreshTime=now;
+            nextServerVersion=target.StateVersion;           
         }
     }
 }

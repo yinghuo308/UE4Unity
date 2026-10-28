@@ -23,6 +23,10 @@ namespace UeNet
         public Dictionary<uint,ActorChannel> ActorChannels{get;}=new Dictionary<uint, ActorChannel>();
         public uint PlayerObjectId{get;internal set;}
         public bool InitialObjectsQueued{get;internal set;}
+        public ReplicationScheduler Scheduler{get;}=new ReplicationScheduler();
+        public FragmentReceiveBuffer FragmentReceiver{get;}=new FragmentReceiveBuffer();
+        public FragmentSendQueue FragmentSender{get;}=new FragmentSendQueue();
+        public bool SendFragmentsFirst{get;set;}=true;
         public Connection(string remoteAs,double now)
         {
             remoteAddress=remoteAs;

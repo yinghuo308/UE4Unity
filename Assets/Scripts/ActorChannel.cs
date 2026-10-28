@@ -31,6 +31,8 @@ public class ActorChannel
         Waiting,
         Removed
     }
+    private const float PositionWakeThreshold=0.001f;
+    private Vector3 lastObservedPosition;
     private readonly Dictionary<ushort,PropertyUpdateData> pendingProperties =
         new Dictionary<ushort, PropertyUpdateData>();
     public ReliableMessageQueue ReliableSender{get;}=new ReliableMessageQueue();
@@ -38,6 +40,11 @@ public class ActorChannel
     private readonly Dictionary<uint,InventoryReplicator>inventoryReplicators=new Dictionary<uint, InventoryReplicator>();
     private readonly Dictionary<uint,ReplicatedItemView>itemViews=new Dictionary<uint, ReplicatedItemView>();
     private readonly Dictionary<uint,ItemReplicator> itemReplicators=new Dictionary<uint, ItemReplicator>();
+    private bool dormant;
+    private bool forceNetUpdate;
+    public bool Isdormant=>dormant;
+    public bool HasForcedUpdate=>forceNetUpdate;
+    private double lastActivityTime;
     public ActorChannel(uint objectId)
     {
         ObjectId = objectId;
@@ -51,7 +58,12 @@ public class ActorChannel
             return;
         }
         Target = target;
+        lastObservedPosition=target.transform.position;
         replicator = new ObjectReplicator(target);
+        if (target.IsServerObject)
+        {
+            replicator.InitializeServerBaseline(Time.realtimeSinceStartupAsDouble);
+        }
         State = ActorChannelState.Open;
         inventoryReplicators.Clear();
         if (target.IsServerObject)
@@ -135,6 +147,7 @@ public class ActorChannel
     public uint QueueReliableBunch(uint connectionId,NetBunch bunch)
     {
         string data=JsonUtility.ToJson(bunch);
+        MarkActivity(Time.realtimeSinceStartupAsDouble);
         return ReliableSender.Enqueue(messageId=>NetMessage.Encode(NetMessageType.ActorBunch,
                                 connectionId,
                                 messageId,
@@ -286,6 +299,11 @@ public class ActorChannel
     public void QueueInventoryUpdates(uint connectionId)
     {
         if(State!=ActorChannelState.Open||Target==null||!Target.IsServerObject)return;
+        if (Isdormant &&
+            !HasForcedUpdate)
+        {
+            return;
+        }
         foreach(InventoryReplicator inventoryReplicator in inventoryReplicators.Values)
         {
             if(!inventoryReplicator.TryBuildUpdate(out InventoryStateData update))
@@ -479,6 +497,11 @@ public class ActorChannel
         {
             return;
         }
+        if (Isdormant &&
+            !HasForcedUpdate)
+        {
+            return;
+        }
         foreach(ItemReplicator itemReplicator in itemReplicators.Values)
         {
             if(!itemReplicator.TryBuildUpdate(out ReplicatedItemData update))
@@ -495,4 +518,60 @@ public class ActorChannel
             itemReplicator.CommitQueued(update);
         }
     }
+    public void SetDormant()
+    {
+        dormant=true;
+        forceNetUpdate=false;
+    }
+    public void ForceNetUpdate()
+    {
+        MarkActivity(Time.realtimeSinceStartupAsDouble);
+        forceNetUpdate=true;
+    }
+    public void ClearForcedUpdate()
+    {
+        forceNetUpdate=false;
+    }
+    public void MarkActivity(double now)
+    {
+        lastActivityTime=now;
+        dormant=false;
+    }
+    public bool ShouldEnterDormancy(double now,double idleSeconds,bool hasPendingProperties)
+    {
+        return State==ActorChannelState.Open&&!dormant&&
+            !HasForcedUpdate&&ReliableSender.PendingCount==0
+                &&now-lastActivityTime>=idleSeconds&&!hasPendingProperties;
+    }
+    public void Wake(double now)
+    {
+        dormant = false;
+        forceNetUpdate = false;
+        lastActivityTime = now;
+    }
+    public bool TryBuildActorUpdate(double now,out ObjectUpdateData update)
+    {
+        update=null;
+        if(State!=ActorChannelState.Open||Target==null||!Target.IsServerObject
+                || replicator == null)
+        {
+            return false;
+        }        
+        return replicator.TryCaptureUpdate(now,out update,allowPeriodicRefresh:false);
+    }
+    public void CheckPositionAndWake(double now)
+    {
+        if(State!=ActorChannelState.Open||Target==null||!Target.IsServerObject)return;
+        Vector3 currentPosition = Target.transform.position;
+        float distanceSquared =(currentPosition - lastObservedPosition).sqrMagnitude;
+         if (distanceSquared <=
+        PositionWakeThreshold * PositionWakeThreshold)
+        {
+            return;
+        }
+        lastObservedPosition = currentPosition;
+        // 唤醒通道，并重新计算空闲时间。
+        MarkActivity(now);
+    }
+
 }
