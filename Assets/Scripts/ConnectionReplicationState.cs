@@ -20,6 +20,7 @@ namespace UeNet
         private readonly Queue<uint>sendHistory=new Queue<uint>();
         private const int MaxTrackedFragmentGroups=16;
         private readonly Dictionary<uint,ObjectUpdateData>sentFragmentGroups=new Dictionary<uint, ObjectUpdateData>();
+        private readonly Dictionary<uint,uint>ownerVersions=new Dictionary<uint, uint>();
         public void ForgetFragmentGroup(uint groupId)
         {
             sentFragmentGroups.Remove(groupId);
@@ -39,6 +40,14 @@ namespace UeNet
         public void Merge(ObjectUpdateData update)
         {
             if(update==null||update.ObjectId==0||update.Properties==null)return;
+            if(ownerVersions.TryGetValue(update.ObjectId,out uint version)&&
+                    update.OwnerVersion != version)
+            {
+                if(update.OwnerVersion<version)
+                    return;
+                RemoveObject(update.ObjectId);
+            }
+            ownerVersions[update.ObjectId]=update.OwnerVersion;
             foreach(PropertyUpdateData item in update.Properties)
             {
                 if(item==null)continue;
@@ -64,7 +73,11 @@ namespace UeNet
             var result=new List<ObjectUpdateData>();
             foreach(var pair in pending)
             {
-                var update=new ObjectUpdateData{ObjectId=pair.Key};
+                var update=new ObjectUpdateData
+                {
+                    ObjectId=pair.Key,
+                    OwnerVersion=ownerVersions[pair.Key]
+                };
                 foreach(PendingProperty property in pair.Value.Values)
                 {
                     if(now-property.LastSentTime<retryInterval)continue;
@@ -85,7 +98,8 @@ namespace UeNet
                 continue;
                 var snapshot = new ObjectUpdateData
                 {
-                    ObjectId = update.ObjectId
+                    ObjectId = update.ObjectId,
+                    OwnerVersion=update.OwnerVersion
                 };
 
                 foreach (PropertyUpdateData item in update.Properties)
@@ -94,7 +108,10 @@ namespace UeNet
                         snapshot.Properties.Add(Copy(item));
                 }
                 snapshots.Add(snapshot);
-                if(!pending.TryGetValue(update.ObjectId,out var properties))
+                if (!ownerVersions.TryGetValue(
+                        update.ObjectId, out uint currentOwnerVersion) ||
+                    update.OwnerVersion != currentOwnerVersion ||
+                    !pending.TryGetValue(update.ObjectId, out var properties))
                 {
                     continue;
                 }
@@ -134,6 +151,7 @@ namespace UeNet
         public void RemoveObject(uint objectId)
         {
             pending.Remove(objectId);
+            ownerVersions.Remove(objectId);
             var packetsToRemove = new List<uint>();
             foreach (var pair in sentPackets)
             {
@@ -165,6 +183,7 @@ namespace UeNet
             sentPackets.Clear();
             sendHistory.Clear();
             sentFragmentGroups.Clear();
+            ownerVersions.Clear();
         }
         private PropertyUpdateData Copy(PropertyUpdateData item)
         {
@@ -202,7 +221,10 @@ namespace UeNet
             }
             if(snapshot.Properties.Count==0)return false;
             sentFragmentGroups.Add(groupId,snapshot);
-            if(pending.TryGetValue(update.ObjectId,out var properties))
+            if (ownerVersions.TryGetValue(
+                update.ObjectId, out uint currentOwnerVersion) &&
+            update.OwnerVersion == currentOwnerVersion &&
+            pending.TryGetValue(update.ObjectId, out var properties))
             {
                 foreach (PropertyUpdateData item in snapshot.Properties)
                 {
@@ -229,6 +251,12 @@ namespace UeNet
         }
         private int AcknowledgeSnapshot(ObjectUpdateData sent)
         {
+            if (!ownerVersions.TryGetValue(
+                    sent.ObjectId, out uint version) ||
+                sent.OwnerVersion != version)
+            {
+                return 0;
+            }
             if(!pending.TryGetValue(sent.ObjectId,out var properties))
             {
                 return 0;

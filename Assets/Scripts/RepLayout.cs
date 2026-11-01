@@ -20,20 +20,6 @@ namespace UeNet
                     readState:state=>state.Health,
                     writeState:(state,value)=>state.Health=value
                 ),
-                 new RepProperty<Vector3>(
-                    propertyId: 2,
-                    name: "Position",
-                    readObject: obj => obj.transform.position,
-                    writeObject: (obj, value) =>
-                        obj.transform.position = value,
-                    readState: state => state.Position,
-                    writeState: (state, value) =>
-                        state.Position = value,
-                    // 位置差距不超过阈值时，认为相同。
-                    valuesEqual: (a, b) =>
-                        (a - b).sqrMagnitude <=
-                        PositionThreshold * PositionThreshold
-                ),
                 new RepProperty<uint>(
                     propertyId:3,
                     name:"Target",
@@ -54,7 +40,17 @@ namespace UeNet
                     readState:state=>state.PrivateScore,
                     writeState:(state,value)=>state.PrivateScore=value,
                     condition:RepProperty.ReplicationCondition.OwnerOnly
+                ),
+                new RepProperty<MovementStateData>(
+                    propertyId:7,
+                    name:"Movement",
+                    readObject:obj=>obj.GetServerMovement(),
+                    writeObject:(obj,value)=>obj.ApplyReplicatedMovement(value),
+                    readState: state =>MovementStateData.FromState(state),
+                    writeState: (state, value) =>value.WriteTo(state),
+                    valuesEqual: (a, b) =>MovementStateData.SameMovement(a, b)
                 )
+                
             };
         }
         public ObjectStateData Capture(NetworkObject target)

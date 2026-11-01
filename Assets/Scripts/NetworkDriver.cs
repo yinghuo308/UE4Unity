@@ -1,6 +1,7 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+    using System.IO;
 using Unity.Mathematics;
 using Unity.VisualScripting;
 using UnityEngine;
@@ -40,7 +41,17 @@ namespace UeNet
         private uint localPlayerObjectId;
         private readonly Dictionary<uint,ObjectReplicator> objectReplicators=new Dictionary<uint, ObjectReplicator>();
         [SerializeField,Min(1)]private int propertyBytesPerTick=4096;
-
+        [SerializeField]private bool simulateNetwork = false;
+        [SerializeField, Range(0f, 1f)]private float simulatedLoss = 0.1f;
+        [SerializeField, Range(0f, 1f)]private float simulatedDuplicate = 0.02f;
+        [SerializeField, Min(0f)]private float simulatedLatencyMs = 100f;
+        [SerializeField, Min(0f)]private float simulatedJitterMs = 50f;
+        [SerializeField] private int simulationSeed = 12345;
+        private SimulatedTransport simulatedTransport;
+        [SerializeField] private NetworkPrefabRegistry prefabRegistry;
+        [SerializeField] private string playerObjectType="Player";
+        [SerializeField] private string testSpawnObjectType="Enemy";
+        [SerializeField] private Vector3 testSpawnPosition=new Vector3(3f,0,0);
         public sealed class IncomingMessage
         {
             public NetMessageType Type;
@@ -151,11 +162,6 @@ namespace UeNet
         private void UpdateServerReplication()
         {
             ServerSetItemCount(testRpcObjectId,2,10);
-        }
-        [ContextMenu("休眠测试")]
-        private void SetActorDr()
-        {
-            ServerSetActorDormant(1,true);
         }
         [ContextMenu("测试服务器销毁")]
         public void DespawnTestObject()
@@ -296,12 +302,9 @@ namespace UeNet
         {
             try
             {
-                transport=new UdpTransport(isServer?serverPort:0);
-                if (!isServer)
-                {
-                    serverConnection=new Connection(serverAddress,Now);
-                    nextConnectionRequestTime=Now;
-                }
+               CreateTransport();
+               if(!isServer)
+                    BeginClientConnection();
             }
             catch(Exception e)
             {
@@ -317,10 +320,16 @@ namespace UeNet
             if(transport==null)return;
             try
             {
+                if (simulatedTransport != null)
+                {
+                    simulatedTransport.Enabled = simulateNetwork;
+                }
+                simulatedTransport?.Pump();
                 ReceivePackets();
                 if(isServer)UpdateServer();
                 else UpdateClient();
                 UpdatePendingRpcs();
+                simulatedTransport?.Pump();
             }
             catch(Exception e)
             {
@@ -354,10 +363,13 @@ namespace UeNet
                 uint messageId = first.MessageId;
                 bool reliable = first.Reliable;
                 string data = first.Data;
+                if(!CheckHandshake(datagram.Remote,packet,first,
+                                out NetHandshakeData handshake))
+                    continue;
                 Connection connection = FindPacketConnection(
                     datagram.Remote,
                     type,
-                    connectionId);
+                    connectionId,handshake );
                 if (connection == null)
                     continue;
                 double now = Now;
@@ -539,14 +551,12 @@ namespace UeNet
                     // 允许同一连接的重复确认。
                     connection.lastReceiveTime = Now;
                 }
-
                 return;
             }
 
             if (connection.connectionState != ConnectionState.Connected ||
                 connection.connectionID != connectionId)
                 return;
-
             if (type == NetMessageType.Heartbeat)
             {
                 connection.lastReceiveTime = Now;
@@ -559,10 +569,7 @@ namespace UeNet
             }
             else if (type == NetMessageType.DisConnect)
             {
-                connection.connectionState =
-                    ConnectionState.DisConnect;
-                ClearActorChannels(connection);
-                Debug.Log("服务端已断开连接");
+                 EndClientConnection(connection,"服务器主动断开");
             }
             else if (type == NetMessageType.ActorBunch)
             {
@@ -605,6 +612,8 @@ namespace UeNet
             {
                 nextStateSyncTime=now+StateSyncInterval;
                 ProcessPendingPlayerDespawns();
+                ReleaseDisconnectedObjectOwners();
+                SampleServerMovements(now);
                 foreach(Connection connection in connections.Values)
                 {
                     if (connection.connectionState == ConnectionState.Connected)
@@ -637,10 +646,7 @@ namespace UeNet
             connection.FragmentReceiver.Expire(now);
             if (now - connection.lastReceiveTime >= TimeoutSeconds)
             {
-                connection.connectionState =
-                    ConnectionState.DisConnect;
-                ClearActorChannels(connection);
-                Debug.Log("连接超时");
+                EndClientConnection(connection,"连接超时");
                 return;
             }
             FlushReliable(connection);
@@ -654,7 +660,6 @@ namespace UeNet
                     nextConnectionRequestTime =
                         now + RetryInterval;
                 }
-
                 return;
             }
 
@@ -667,7 +672,13 @@ namespace UeNet
         }
         private void Send(Connection connection,NetMessageType type)
         {
-            byte[] payload=NetMessage.Encode(type,connection.connectionID);
+            string data=string.Empty;
+            if(type==NetMessageType.ConnectRequest||
+                type == NetMessageType.ConnectAccept)
+            {
+                data=NetProtocol.CreateHandshakeJson(connection.ClientNonce,connection.SessionId);
+            }
+            byte[] payload=NetMessage.Encode(type,connection.connectionID,0,false,data);
             SendPayload(connection,payload,0);
         }
         private uint SendPayload(
@@ -676,7 +687,7 @@ namespace UeNet
             uint reliableMessageId)
         {
             NetPacket packet =
-                connection.Packets.CreatePacket(payload);
+                connection.Packets.CreatePacket(payload,connection.SessionId);
             byte[] bytes =
                 NetPacketCodec.Encode(packet);
             transport.Send(
@@ -701,29 +712,44 @@ namespace UeNet
             //     $"ReliableMessageId={reliableMessageId}",
             //     this);
         }
+        [ContextMenu("客户端断开连接")]
         public void Disconnect()
         {
-            if(isServer||transport==null||serverConnection==null)return;
-            Connection connection=serverConnection;
-            if(connection.connectionState==ConnectionState.DisConnect)
-            return;
+            EndClientConnection(serverConnection,"主动断开",notifyServer:true);
+        }
+        [ContextMenu("客户端重新连接")]
+        public void Reconnect()
+        {
+            if (!Application.isPlaying || isServer)
+                return;
+            if (serverConnection != null &&
+                serverConnection.connectionState !=
+                    ConnectionState.DisConnect)
+            {
+                Debug.LogWarning("请先断开当前连接，再执行重新连接。",
+                    this);
+                return;
+            }
             try
             {
-                if (connection.connectionState == ConnectionState.Connected)
-                {
-                    Send(connection,NetMessageType.DisConnect);
-                }
+                CreateTransport();
+                BeginClientConnection();
+                enabled = true;
+                Debug.Log("客户端开始重新连接。",this);
             }
-            finally
+            catch (Exception exception)
             {
-                connection.connectionState=ConnectionState.DisConnect;
-                ClearActorChannels(connection);
+                Debug.LogException(exception, this);
+                CloseTransport();
+                enabled = false;
             }
-
         }
-        
         private void CloseTransport()
         {
+            if (!isServer)
+            {
+                EndClientConnection(serverConnection,"传输关闭");
+            }
             pendingPlayerDespawns.Clear();
             objectReplicators.Clear();
             if (serverConnection != null)
@@ -747,9 +773,9 @@ namespace UeNet
             networkObjectRegistry.Clear();
             if (transport == null)
                 return;
-
             transport.Dispose();
             transport = null;
+            simulatedTransport=null;
         }
         private void OnDestroy()
         {
@@ -760,26 +786,36 @@ namespace UeNet
             CloseTransport();
         }
         private Connection FindPacketConnection(string remote,NetMessageType type,
-                                                uint connectionId)
+                       uint connectionId,NetHandshakeData handshake=null)
         {
             if (isServer)
             {
                 if (type == NetMessageType.ConnectRequest)
                 {
-                    if(connectionId!=0)return null;
-                    if(!connections.TryGetValue(remote,out Connection connection))
+                    if (connectionId != 0 ||handshake == null ||
+                        handshake.ClientNonce == 0)
                     {
-                        if (nextConnectionId == 0)
-                    throw new InvalidOperationException("连接编号已耗尽。");
-                    connection = new Connection(remote, Now)
+                        return null;
+                    }
+                    if(connections.TryGetValue(remote,out Connection repeated))
+                    {
+                        return repeated.connectionState==ConnectionState.Connected&&
+                                repeated.ClientNonce==handshake.ClientNonce?repeated:null;
+                    }
+                    if (nextConnectionId == 0)
+                    {
+                        throw new InvalidOperationException("连接编号已耗尽。");
+                    }
+                     var connection = new Connection(remote, Now)
                     {
                         connectionID = nextConnectionId++,
-                        connectionState = ConnectionState.Connected
+                        connectionState = ConnectionState.Connected,
+                        ClientNonce = handshake.ClientNonce,
+                        SessionId = NetProtocol.CreateToken()
                     };
                     connections.Add(remote, connection);
-                    Debug.Log(
-                        $"客户端接入：{connection.connectionID}，{remote}",this);
-                    }
+                    Debug.Log($"客户端接入：{connection.connectionID}，{remote}",
+                        this);
                     return connection;
                 }
                 if(!connections.TryGetValue(remote,out Connection existing))
@@ -822,19 +858,6 @@ namespace UeNet
                 type!=NetMessageType.ActorBunch)
                 return null;
             return server;
-        }
-        private void QueueReliable(
-            Connection connection,
-            NetMessageType type,string data)
-        {
-            connection.ReliableMessageQueue.Enqueue(
-                messageId =>
-                    NetMessage.Encode(
-                        type,
-                        connection.connectionID,
-                        messageId,
-                        true,data),
-                Now);
         }
         private void FlushReliable(
             Connection connection)
@@ -913,12 +936,9 @@ namespace UeNet
                     Type = NetBunchType.Properties,
                     PayloadJson = JsonUtility.ToJson(update)
                 };
-                byte[] payload = NetMessage.Encode(
-                NetMessageType.ActorBunch,
-                connection.connectionID,
-                0,
-                false,
-                JsonUtility.ToJson(bunch));
+                byte[] payload = PropertyMessageCodec.Encode(
+                connection.connectionID,update);
+
                 candidates.Add(new ReplicationScheduler.Candidate
                 {
                     Update=update,
@@ -992,7 +1012,12 @@ namespace UeNet
         private void SendSpawnObject(Connection connection,NetworkObject networkObject)
         {
             if(networkObject==null)return;
-
+            if (!prefabRegistry.TryGetPrefab(
+                    networkObject.ObjectType,out _))
+            {
+                throw new InvalidOperationException(
+                    $"服务器对象类型未登记：{networkObject.ObjectType}");
+            }
             uint objectId = networkObject.NetObjectId;
             // 同一连接，不重复打开同一个对象通道。
             if (connection.ActorChannels.ContainsKey(objectId))
@@ -1000,10 +1025,13 @@ namespace UeNet
             SpawnData spawnData = new SpawnData
             {
                 ObjectId = networkObject.NetObjectId,
-                ObjectType = "NetworkObject",
+                ObjectType = networkObject.ObjectType,
                 OwnerConnectId=networkObject.OwnerConnectId,
+                OwnerVersion=networkObject.OwnerVersion,
+                IsPlayerObject=networkObject.IsPlayerObject,
                 StateVersion=networkObject.StateVersion,
                 InitialProperties=BuildInitialProperties(connection,networkObject),
+                HasInventory=networkObject.Inventory!=null,
                 Inventory=networkObject.Inventory!=null?InventoryRepLayout.Capture(networkObject.Inventory):null
             };
             NetBunch bunch=new NetBunch
@@ -1225,6 +1253,8 @@ namespace UeNet
                         continue;
                     }
                     channel.CheckPositionAndWake(now);
+                    channel.CheckRotationAndWake(now);
+                    channel.CheckVelocityAndWake(now);
                     if(channel.Isdormant&&!channel.HasForcedUpdate)continue;
                     if(channel.TryBuildActorUpdate(now,out ObjectUpdateData update))
                     {
@@ -1335,7 +1365,10 @@ namespace UeNet
                         }
                         channel.ReceiveSubobjectItemProperties(bunch.PayloadJson);
                         break;
-                    }    
+                    }
+                case NetBunchType.OwnerChanged:
+                    HandleOwnerChanged(connection,bunch);
+                    break;    
             }
         }
 
@@ -1358,7 +1391,8 @@ namespace UeNet
                         bunch.ObjectId,
                         out NetworkObject serverObject) ||
                     serverObject == null ||
-                    serverObject.OwnerConnectId != connection.connectionID)
+                    serverObject.OwnerConnectId != connection.connectionID||
+                    call.OwnerVersion!=serverObject.OwnerVersion)
                 {
                     Debug.LogWarning(
                         $"拒绝无权限的 RPC：ConnectionId={connection.connectionID}, " +
@@ -1397,12 +1431,20 @@ namespace UeNet
             }
             if (spawnData == null ||
                 spawnData.ObjectId != bunch.ObjectId ||
-                spawnData.ObjectType != "NetworkObject"||
+                string.IsNullOrWhiteSpace(spawnData.ObjectType)||
                 spawnData.InitialProperties==null)
             {
                 return;
             }
-            if (spawnData.Inventory != null)
+            if (!prefabRegistry.TryGetPrefab(
+                    spawnData.ObjectType,out _))
+            {
+                EndClientConnection(connection,
+                    $"本地未登记服务器对象类型：{spawnData.ObjectType}",
+                    notifyServer: true);
+                return;
+            }
+            if (spawnData.HasInventory)
             {
                 if (!InventoryRepLayout.IsValid(
                         spawnData.Inventory) ||
@@ -1418,9 +1460,7 @@ namespace UeNet
                     out ActorChannel channel))
             {
                 channel = new ActorChannel(bunch.ObjectId);
-                connection.ActorChannels.Add(
-                    bunch.ObjectId,
-                    channel);
+                connection.ActorChannels.Add(bunch.ObjectId,channel);
             }
             // 防止重复 Open 重置对象状态。
             if (channel.State != ActorChannelState.Opening)
@@ -1431,17 +1471,37 @@ namespace UeNet
                     out networkObject) ||
                 networkObject == null)
             {
-                GameObject instance = new GameObject(
-                    $"{name}_NetworkObject_{bunch.ObjectId}");
-                networkObject =
-                    instance.AddComponent<NetworkObject>();
-                networkObject.StateVersion =
-                    spawnData.StateVersion;
-                networkObjectRegistry.RegisterClientObject(
-                    networkObject,
-                    bunch.ObjectId);
+                if(!prefabRegistry.TryInstantiate(spawnData.ObjectType,out networkObject))
+                {
+                    EndClientConnection(connection,
+                    $"无法生成网路对象:{spawnData.ObjectType}",
+                    notifyServer:true);
+                    return;
+                }
+                networkObject.gameObject.name=$"{name}_{spawnData.ObjectType}_{bunch.ObjectId}";
+                networkObject.StateVersion=spawnData.StateVersion;
+                try
+                {
+                    networkObjectRegistry.RegisterClientObject(networkObject,bunch.ObjectId);
+                }
+                catch
+                {
+                    Destroy(networkObject.gameObject);
+                    throw;
+                }
+            }
+            if (networkObject.ObjectType != spawnData.ObjectType)
+            {
+                EndClientConnection(connection,
+                    $"对象 {bunch.ObjectId} 的类型不一致。",
+                    notifyServer: true);
+                return;
             }
             networkObject.OwnerConnectId=spawnData.OwnerConnectId;
+            networkObject.OwnerVersion=spawnData.OwnerVersion;
+            networkObject.IsPlayerObject=spawnData.IsPlayerObject;
+            if (networkObject.OwnerConnectId != connection.connectionID)
+                 networkObject.PrivateScore = 0;
             foreach(PropertyUpdateData item in spawnData.InitialProperties)
             {
                 if(item==null)continue;
@@ -1456,11 +1516,15 @@ namespace UeNet
                 }
                 property.Apply(networkObject,decoded);
             }
-            if (spawnData.Inventory != null)
+            if (spawnData.HasInventory)
             {
-                InventoryComponent inventory =
-                    networkObject.gameObject
-                        .AddComponent<InventoryComponent>();
+                InventoryComponent inventory =networkObject.gameObject
+                        .GetComponent<InventoryComponent>();
+                if (inventory == null)
+                {
+                    inventory =networkObject.gameObject
+                            .AddComponent<InventoryComponent>();
+                }
                 inventory.Owner = networkObject;
                 inventory.SubobjectId =
                     spawnData.Inventory.SubobjectId;
@@ -1469,8 +1533,9 @@ namespace UeNet
                     spawnData.Inventory);
                 networkObject.Inventory = inventory;
             }
-            channel.Bind(networkObject);
-            if (networkObject.OwnerConnectId != 0 &&
+            channel.Bind(networkObject,connection.connectionID);
+            if (networkObject.IsPlayerObject &&
+                networkObject.OwnerConnectId != 0 &&
                 networkObject.OwnerConnectId == connection.connectionID)
             {
                 localPlayerObjectId = networkObject.NetObjectId;
@@ -1582,7 +1647,15 @@ namespace UeNet
             connection.Scheduler.Clear();
             connection.FragmentReceiver.Clear();
             connection.FragmentSender.Clear();
-            if(!isServer)networkObjectRegistry.Clear();
+            if(!isServer)
+            {
+                foreach (NetworkObject actor in networkObjectRegistry.GetAllObject())
+                {
+                    if (actor != null)
+                        Destroy(actor.gameObject);
+                }
+                networkObjectRegistry.Clear();
+            }
         }        
         private void SendClientRpc(Connection connection,uint objectId,
                             ushort rpcId,string argsJson,params uint[] objectReferenceIds)
@@ -1610,30 +1683,36 @@ namespace UeNet
         }
         private void SendServerRpc(uint objectId,ushort rpcId,string argsJson,params uint[]objectReferenceIds)
         {
-            if(isServer||serverConnection==null||
-                serverConnection.connectionState!=ConnectionState.Connected)
+            Connection connection=serverConnection;
+            if(isServer || connection == null ||
+                connection.connectionState != ConnectionState.Connected ||
+                !connection.ActorChannels.TryGetValue(
+                    objectId, out ActorChannel channel) ||
+                channel.State != ActorChannelState.Open ||
+                channel.Target == null)
                 {
                     return;
                 }
-            if(!serverConnection.ActorChannels.TryGetValue(objectId,out ActorChannel channel)||
-                    channel.State != ActorChannelState.Open)
+            NetworkObject actor=channel.Target;
+             if (actor.OwnerConnectId != connection.connectionID)
             {
+                Debug.LogWarning("当前客户端不拥有这个对象。", this);
                 return;
             }
             var call=new RpcCallData
             {
                 RpcId=rpcId,
                 Direction=RpcDirection.Server,
+                OwnerVersion=actor.OwnerVersion,
                 ArgsJson=argsJson??string.Empty,
                 ObjectReferenceIds=objectReferenceIds==null?null:new List<uint>(objectReferenceIds)
             };
-            var bunch=new NetBunch
+            QueueReliableBunch(connection, new NetBunch
             {
-                ObjectId=objectId,
-                Type=NetBunchType.Rpc,
-                PayloadJson=JsonUtility.ToJson(call)
-            };
-            QueueReliableBunch(serverConnection,bunch);
+                ObjectId = objectId,
+                Type = NetBunchType.Rpc,
+                PayloadJson = JsonUtility.ToJson(call)
+            });
         }
         private void SpawnPlayerForConnection(Connection owner)
         {
@@ -1646,17 +1725,34 @@ namespace UeNet
             }
              if (owner.PlayerObjectId != 0)
                 return;
-            GameObject instance = new GameObject(
-                $"ServerPlayerObject_{owner.connectionID}");
-            NetworkObject player =
-                instance.AddComponent<NetworkObject>();
+            if (!prefabRegistry.TryInstantiate(
+                    playerObjectType,out NetworkObject player))
+            {
+                throw new InvalidOperationException(
+                    $"无法生成玩家 Prefab：{playerObjectType}");
+            }
+            GameObject instance = player.gameObject;
+            instance.name =$"ServerPlayerObject_{owner.connectionID}";
             player.Health = 100;
             player.PrivateScore=1000;
             // 注册服务器对象，分配网络对象编号。
-            networkObjectRegistry.RegisterServerObject(player);
+            try
+            {
+                networkObjectRegistry.RegisterServerObject(player);
+            }
+            catch
+            {
+                Destroy(instance);
+                throw;
+            }
             // 指定这个对象由哪个客户端控制。
             player.OwnerConnectId = owner.connectionID;
-            InventoryComponent inventory=instance.AddComponent<InventoryComponent>();
+            player.IsPlayerObject=true;
+            InventoryComponent inventory =player.GetComponent<InventoryComponent>();
+            if (inventory == null)
+            {
+                inventory =instance.AddComponent<InventoryComponent>();
+            }
             inventory.Owner=player;
             inventory.SubobjectId=1;
             inventory.StateVersion=0;
@@ -1777,7 +1873,8 @@ namespace UeNet
         {
             var result = new ObjectUpdateData
             {
-                ObjectId = update.ObjectId
+                ObjectId = update.ObjectId,
+                OwnerVersion=update.OwnerVersion
             };
             foreach (PropertyUpdateData item in update.Properties)
             {
@@ -2189,9 +2286,8 @@ namespace UeNet
             var decoded=new List<IncomingMessage>(parts.Count);
             foreach(byte[] part in parts)
             {
-                var item=new IncomingMessage();
-                if(!NetMessage.TryDecode(part,out item.Type,out item.ConnectionId,
-                        out item.MessageId,out item.Reliable,out item.Data))
+                if (!TryDecodeIncomingMessage(part,
+                        out IncomingMessage item))
                 {
                     return false;
                 }
@@ -2233,6 +2329,8 @@ namespace UeNet
         }
         public void HandleFragmentPacket(string remote,NetPacket packet)
         {
+            if(!MatchesSession(remote,packet))
+            return ;
             if (isServer ||!FragmentCodec.TryDecode(packet.Payload,
                     out FragmentData fragment))
             {
@@ -2546,6 +2644,717 @@ namespace UeNet
             this);
     }
 }
+        [ContextMenu("打印连接同步状态")]
+        private void PrintReplicationStats()
+        {
+            if (!Application.isPlaying)
+            {
+                Debug.LogWarning("请在运行时查看同步状态。", this);
+                return;
+            }
+
+            if (isServer)
+            {
+                Debug.Log(
+                    $"服务器当前连接数：{connections.Count}",
+                    this);
+
+                foreach (Connection connection in connections.Values)
+                {
+                    PrintConnectionStats(connection);
+                }
+
+                return;
+            }
+
+            if (serverConnection == null)
+            {
+                Debug.Log("客户端尚未创建服务器连接。", this);
+                return;
+            }
+            PrintConnectionStats(serverConnection);
+        }
+        private void PrintConnectionStats(Connection connection)
+        {
+            if (connection == null)
+                return;
+
+            int actorReliableMessages = 0;
+            int openChannels = 0;
+            int dormantChannels = 0;
+
+            foreach (ActorChannel channel
+                    in connection.ActorChannels.Values)
+            {
+                if (channel == null)
+                    continue;
+
+                // 累加每个 Actor 通道中尚未确认的可靠消息。
+                actorReliableMessages +=
+                    channel.ReliableSender.PendingCount;
+
+                if (channel.State == ActorChannelState.Open)
+                {
+                    openChannels++;
+
+                    if (channel.Isdormant)
+                        dormantChannels++;
+                }
+            }
+
+            string ackDelay =
+                connection.Packets.AcknowledgedCount == 0
+                    ? "暂无"
+                    : $"{connection.Packets.LastAckDelaySeconds * 1000.0:F1} ms";
+
+            Debug.Log(
+                $"连接编号={connection.connectionID}\n" +
+                $"远端地址={connection.remoteAddress}\n" +
+                $"连接状态={connection.connectionState}\n" +
+                $"通道总数={connection.ActorChannels.Count}，" +
+                $"已打开={openChannels}，" +
+                $"其中休眠={dormantChannels}\n" +
+
+                $"连接级待确认可靠消息=" +
+                $"{connection.ReliableMessageQueue.PendingCount}\n" +
+
+                $"Actor 通道待确认可靠消息=" +
+                $"{actorReliableMessages}\n" +
+
+                $"待确认属性条目=" +
+                $"{connection.Replication.PendingPropertyCount}\n" +
+
+                $"发送端未完成分片组=" +
+                $"{connection.FragmentSender.PendingGroupCount}，" +
+                $"队列占用={connection.FragmentSender.QueuedBytes} B\n" +
+
+                $"接收端未完成分片组=" +
+                $"{connection.FragmentReceiver.PendingGroupCount}，" +
+                $"预留={connection.FragmentReceiver.ReservedBytes} B\n" +
+
+                $"跟踪中的未确认包=" +
+                $"{connection.Packets.PendingCount}\n" +
+
+                $"累计已确认包=" +
+                $"{connection.Packets.AcknowledgedCount}\n" +
+
+                $"最近一次包确认耗时={ackDelay}",
+                this);
+        }
+        [ContextMenu("测试位置量化")]
+        private void TestPositionQuantization()
+        {
+            float original = 12.3456f;
+
+            int encoded =
+                PositionQuantization.Encode(original);
+
+            float decoded =
+                PositionQuantization.Decode(encoded);
+
+            if (encoded != 1235 ||
+                Mathf.Abs(decoded - 12.35f) > 0.00001f ||
+                PositionQuantization.Encode(-12.3456f) != -1235)
+            {
+                throw new InvalidOperationException(
+                    "坐标量化结果错误。");
+            }
+
+            Vector3 a = new Vector3(1.001f, 0f, 0f);
+            Vector3 b = new Vector3(1.004f, 0f, 0f);
+            Vector3 c = new Vector3(1.006f, 0f, 0f);
+
+            if (!PositionQuantization.SamePosition(a, b) ||
+                PositionQuantization.SamePosition(a, c))
+            {
+                throw new InvalidOperationException(
+                    "量化位置比较错误。");
+            }
+
+            Debug.Log(
+                $"位置量化测试通过：" +
+                $"{original:F4} → {encoded} → {decoded:F2}",
+                this);
+        }
+        [ContextMenu("打印网络模拟统计")]
+        private void PrintSimulationStats()
+        {
+            if (simulatedTransport == null)
+            {
+                Debug.Log("当前未启用网络模拟。", this);
+                return;
+            }
+            Debug.Log(
+                $"发送请求={simulatedTransport.RequestedPackets}, " +
+                $"实际发包={simulatedTransport.SentPackets}, " +
+                $"实际发送字节={simulatedTransport.SentBytes}, " +
+                $"随机丢弃={simulatedTransport.RandomDroppedPackets}, " +
+                $"队列满丢弃={simulatedTransport.QueueDroppedPackets}, " +
+                $"额外排队副本={simulatedTransport.QueuedDuplicates}, " +
+                $"等待包数={simulatedTransport.PendingPackets}, " +
+                $"等待字节={simulatedTransport.PendingBytes}",
+                this);
+        }
+        [ContextMenu("测试二进制属性消息")]
+        private void TestPropertyMessageCodec()
+        {
+            var state = new ObjectStateData
+            {
+                Health = 80,
+                Position = new Vector3(
+                1.2345f,
+                -2.3456f,
+                3.4567f),
+                TargetObjectId = 9,
+                PrivateScore = -50,
+                Rotation = Quaternion.Euler(10f, 35f, 5f),
+                Velocity = new Vector3(1.5f, 0f, -2f),
+                MovementServerTime=12.5
+            };
+
+            var update = new ObjectUpdateData
+            {
+                ObjectId = 7
+            };
+
+            foreach (RepProperty property
+                    in RepLayout.Instance.Properties)
+            {
+                update.Properties.Add(
+                    property.CreateUpdate(state, 10));
+            }
+
+            byte[] bytes = PropertyMessageCodec.Encode(2, update);
+
+            if (!PropertyMessageCodec.TryDecode(
+                    bytes,
+                    out uint connectionId,
+                    out ObjectUpdateData decoded) ||
+                connectionId != 2 ||
+                decoded.ObjectId != 7 ||
+                decoded.Properties.Count != 4)
+            {
+                throw new InvalidOperationException(
+                    "二进制属性消息解析失败。");
+            }
+            var restored = new ObjectStateData();
+            foreach (PropertyUpdateData item in decoded.Properties)
+            {
+                if (item.PropertyVersion != 10 ||
+                    !RepLayout.Instance.TryGetProperty(
+                        item.PropertyId,
+                        out RepProperty property) ||
+                    !property.TryReadUpdate(item, restored))
+                {
+                    throw new InvalidOperationException(
+                        "属性值或版本解析失败。");
+                }
+            }
+            if (restored.MovementServerTime !=
+                    state.MovementServerTime ||
+                restored.Health != state.Health ||
+                !PositionQuantization.SamePosition(
+                    restored.Position,
+                    state.Position) ||
+                restored.TargetObjectId != state.TargetObjectId ||
+                restored.PrivateScore != state.PrivateScore ||
+                Quaternion.Angle(
+                    restored.Rotation,
+                    state.Rotation) > 0.1f ||
+                (restored.Velocity - state.Velocity).sqrMagnitude
+                    > 0.000001f)
+            {
+                throw new InvalidOperationException(
+                    "属性往返后内容不一致。");
+            }
+            Debug.Log(
+                $"二进制属性测试通过，消息长度={bytes.Length} 字节。",
+                this);
+        }
+       [ContextMenu("测试变长整数")]
+    private void TestPackedIntegerCodec()
+{
+    int[] values =
+    {
+        0,
+        1,
+        -1,
+        63,
+        -64,
+        64,
+        -65,
+        1000,
+        -1000,
+        int.MinValue,
+        int.MaxValue
+    };
+
+    foreach (int value in values)
+    {
+        byte[] bytes;
+
+        using (var stream = new MemoryStream())
+        using (var writer = new BinaryWriter(stream))
+        {
+            PackedIntegerCodec.WriteInt32(writer, value);
+
+            writer.Flush();
+            bytes = stream.ToArray();
+        }
+
+        using (var stream = new MemoryStream(bytes, false))
+        using (var reader = new BinaryReader(stream))
+        {
+            int restored =
+                PackedIntegerCodec.ReadInt32(reader);
+
+            if (restored != value ||
+                stream.Position != stream.Length)
+            {
+                throw new InvalidOperationException(
+                    $"变长整数往返失败：{value}");
+            }
+        }
+
+        Debug.Log(
+            $"整数={value}，编码长度={bytes.Length} 字节。",
+            this);
+    }
+
+    Debug.Log("变长整数测试全部通过。", this);
+}
+        private bool TryDecodeIncomingMessage(byte[]bytes,out IncomingMessage item)
+        {
+            item = null;
+            if (PropertyMessageCodec.IsPropertyMessage(bytes))
+            {
+                if (isServer ||
+                    !PropertyMessageCodec.TryDecode(
+                        bytes,out uint connectionId,
+                        out ObjectUpdateData update))
+                {
+                    return false;
+                }
+                var bunch = new NetBunch
+                {
+                    ObjectId = update.ObjectId,
+                    Type = NetBunchType.Properties,
+                    PayloadJson = JsonUtility.ToJson(update)
+                };
+                item = new IncomingMessage
+                {
+                    Type = NetMessageType.ActorBunch,
+                    ConnectionId = connectionId,
+                    MessageId = 0,
+                    Reliable = false,
+                    Data = JsonUtility.ToJson(bunch)
+                };
+                return true;
+            }
+            var legacy = new IncomingMessage();
+            if (!NetMessage.TryDecode(bytes,out legacy.Type,
+                    out legacy.ConnectionId,out legacy.MessageId,
+                    out legacy.Reliable,out legacy.Data))
+            {
+                return false;
+            }
+            item = legacy;
+            return true;
+        }
+        private void SampleServerMovements(double now)
+        {
+            if(!isServer)return;
+            foreach(NetworkObject actor in networkObjectRegistry.GetAllObject())
+            {
+                if (actor != null && actor.IsServerObject)
+                {
+                    actor.SampleServerMovement(now);
+                }
+            }
+        }
+        private bool CheckHandshake(string remote,NetPacket packet,
+                IncomingMessage message,out NetHandshakeData handshake)
+        {
+            handshake=null;
+            bool request=message.Type==NetMessageType.ConnectRequest;
+            bool accept=message.Type==NetMessageType.ConnectAccept;
+            bool reject =message.Type == NetMessageType.ConnectReject;
+            if (!request && !accept && !reject)
+                return MatchesSession(remote,packet);
+            if (!NetProtocol.TryRead(message.Data,
+                    out handshake) ||handshake.ClientNonce == 0)
+            {
+                return false;
+            }
+            if (isServer)
+            {
+                if (!request||packet.SessionId != 0 ||
+                    packet.HasAck ||handshake.SessionId != 0)
+                    return false;
+                if(!NetProtocol.TryValidate(message.Data,out string reason))
+                {
+                    SendConnectionRejected(remote,handshake.ClientNonce,reason);
+                    return false;
+                }
+                if(connections.TryGetValue(remote,out Connection existing)&&
+                                    existing.ClientNonce != handshake.ClientNonce)
+                {
+                    SendConnectionRejected(remote,handshake.ClientNonce,
+                        "该地址的旧连接尚未结束，请断开或等待超时后重试。");
+                    return false;
+                }
+                return true;
+            }
+            Connection connection = serverConnection;
+            if (connection == null ||
+                connection.connectionState ==ConnectionState.DisConnect ||
+                remote != connection.remoteAddress||
+                handshake.ClientNonce!=connection.ClientNonce)
+            {
+                return false;
+            }
+            if (reject)
+            {
+                if (packet.SessionId != 0 ||packet.HasAck ||
+                    handshake.SessionId != 0)
+                {
+                    return false;
+                }
+                 if (connection.connectionState ==ConnectionState.Connecting)
+                {
+                    FailHandshake(connection,
+                        string.IsNullOrEmpty(handshake.Reason)
+                        ? "服务器拒绝连接。"
+                        : handshake.Reason);
+                }
+                return false;
+            }
+            if(!accept||message.ConnectionId == 0 ||
+                handshake.SessionId == 0 ||packet.SessionId != handshake.SessionId)
+                return false;
+            if(!NetProtocol.TryValidate(message.Data,out string error))
+            {
+                if (connection.connectionState == ConnectionState.Connecting)
+                {
+                    FailHandshake(connection,error);
+                }
+                return false;
+            }
+            if (connection.connectionState ==ConnectionState.Connected)
+            {
+                return connection.connectionID ==message.ConnectionId &&
+                    connection.SessionId ==handshake.SessionId;
+            }
+            connection.SessionId = handshake.SessionId;
+            return true;
+        }
+        private void FailHandshake(Connection connection,string reason)
+        {
+            EndClientConnection(connection,$"握手失败：{reason}");
+        }
+        private void SendConnectionRejected(string remote,ulong clientNoce,string reason)
+        {
+            byte[]payload=NetMessage.Encode(
+                NetMessageType.ConnectReject,
+                0,
+                0,
+                false,
+                NetProtocol.CreateHandshakeJson(clientNoce,0,reason)
+            );
+            var packet=new NetPacket(0,false,0,0,0,payload);
+            transport.Send(remote,NetPacketCodec.Encode(packet));
+        }
+        private bool MatchesSession(string remote,NetPacket packet)
+        {
+            Connection connection;
+            if (isServer)
+            {
+                if (!connections.TryGetValue(remote,out connection))
+                {
+                    return false;
+                }
+            }
+            else
+            {
+                connection=serverConnection;
+            }
+            return connection != null &&
+                connection.remoteAddress == remote &&
+                connection.connectionState ==ConnectionState.Connected &&
+                connection.SessionId != 0 &&packet.SessionId == connection.SessionId;
+        }
+        private void CreateTransport()
+        {
+            if (prefabRegistry == null)
+            {
+                throw new InvalidOperationException(
+                    "请给 NetworkDriver 设置 PrefabRegistry。");
+            }
+            prefabRegistry.Initialize();
+            if (isServer &&!prefabRegistry.TryGetPrefab
+                                (playerObjectType,out _))
+            {
+                throw new InvalidOperationException(
+                    $"玩家类型未登记：{playerObjectType}");
+            }
+            if (transport != null)
+                return;
+            ITransport udp =new UdpTransport(isServer ? serverPort : 0);
+            try
+            {
+                var simulation = new SimulatedTransport(
+                    udp,
+                    () => Now,
+                    simulatedLoss,
+                    simulatedDuplicate,
+                    simulatedLatencyMs / 1000.0,
+                    simulatedJitterMs / 1000.0,
+                    unchecked(simulationSeed + (isServer ? 0 : 1)))
+                {
+                    Enabled = simulateNetwork
+                };
+                simulatedTransport = simulation;
+                transport = simulation;
+            }
+            catch
+            {
+                udp.Dispose();
+                throw;
+            }
+        }
+        private void BeginClientConnection()
+        {
+            double now = Now;
+            despawnedObjectIds.Clear();
+            acknowledgedSequences.Clear();
+            localPlayerObjectId = 0;
+            serverConnection = new Connection(serverAddress, now)
+            {
+                ClientNonce = NetProtocol.CreateToken()
+            };
+            nextConnectionRequestTime = now;
+        }
+        private void EndClientConnection(Connection connection,string reason,bool notifyServer=false)
+        {
+            if (isServer ||connection == null ||connection != serverConnection)
+            {
+                return;
+            }
+            try
+            {
+            simulatedTransport?.DiscardPending();
+            if (notifyServer &&transport != null &&
+                    connection.connectionState ==ConnectionState.Connected)
+                {
+                    Send(connection,NetMessageType.DisConnect);
+                }
+            }
+            catch (Exception exception)
+            {
+                Debug.LogWarning($"结束连接时发送通知失败：{exception.Message}",
+                    this);
+            }
+            finally
+            {
+                connection.connectionState=ConnectionState.DisConnect;
+                ClearActorChannels(connection);
+                connection.Replication.Clear();
+                connection.ReliableReceiver.Clear();
+                despawnedObjectIds.Clear();
+                acknowledgedSequences.Clear();
+                localPlayerObjectId=0;
+                nextConnectionRequestTime=double.PositiveInfinity;
+                serverConnection=null;
+                Debug.Log($"客户端连接已结束{reason}",this);
+            }
+        }
+        [ContextMenu("测试按类型生成网络对象")]
+        private void SpawnTypedTestObject()
+        {
+             if (!Application.isPlaying ||
+                    !isServer ||
+                    transport == null)
+                {
+                    return;
+                }
+            if (!prefabRegistry.TryInstantiate(
+                    testSpawnObjectType,
+                    out NetworkObject actor))
+            {
+                Debug.LogWarning(
+                    $"测试类型未登记：{testSpawnObjectType}",
+                    this);
+                return;
+            }
+            actor.transform.position = testSpawnPosition;
+            try
+            {
+                networkObjectRegistry.RegisterServerObject(actor);
+            }
+            catch
+            {
+                Destroy(actor.gameObject);
+                throw;
+            }
+            InventoryComponent inventory =actor.GetComponent<InventoryComponent>();
+            if (inventory != null)
+            {
+                inventory.Owner = actor;
+                inventory.SubobjectId = 1;
+                actor.Inventory = inventory;
+            }
+            objectReplicators.Add(actor.NetObjectId,new ObjectReplicator(actor));
+             foreach (Connection recipient in connections.Values)
+            {
+                if (recipient.connectionState ==ConnectionState.Connected &&
+                    IsActorRelevant(recipient, actor))
+                {
+                    SendSpawnObject(recipient, actor);
+                }
+            }
+        }
+        private Connection FindConnectedOwner(uint connectionId)
+        {
+            foreach (Connection connection in connections.Values)
+            {
+                if (connection.connectionID == connectionId &&
+                    connection.connectionState == ConnectionState.Connected)
+                {
+                    return connection;
+                }
+            }
+            return null;
+        }
+        public bool ServerSetObjectOwner(uint objectId,uint newOwnerConnectionId)
+        {
+             if (!isServer || transport == null ||
+                !networkObjectRegistry.TryGet(
+                    objectId, out NetworkObject actor) ||
+                actor == null || !actor.IsServerObject ||
+                actor.IsPlayerObject)
+            {
+                return false;
+            }
+             if (newOwnerConnectionId != 0 &&
+                FindConnectedOwner(newOwnerConnectionId) == null)
+            {
+                return false;
+            }
+            if (actor.OwnerConnectId == newOwnerConnectionId)
+                return true;
+            if (actor.OwnerVersion == uint.MaxValue)
+                return false;
+             foreach (Connection recipient in connections.Values)
+            {
+                if (recipient.connectionState == ConnectionState.Connected &&
+                    recipient.ActorChannels.TryGetValue(
+                        objectId, out ActorChannel channel) &&
+                    channel.State == ActorChannelState.Open &&
+                    channel.ReliableSender.PendingCount >= 256)
+                {
+                    return false;
+                }
+            }
+            uint previousOwner=actor.OwnerConnectId;
+            actor.OwnerConnectId=newOwnerConnectionId;
+            actor.OwnerVersion++;
+            double now=Now;
+            foreach(Connection recipient in connections.Values)
+            {
+                if(recipient.connectionState!=ConnectionState.Connected)
+                    continue;
+                recipient.Replication.RemoveObject(objectId);
+                recipient.FragmentSender.RemoveObject(objectId);
+                recipient.Scheduler.RemoveObject(objectId);
+                if (!recipient.ActorChannels.TryGetValue(
+                        objectId, out ActorChannel channel))
+                {
+                    if (IsActorRelevant(recipient, actor))
+                        SendSpawnObject(recipient, actor);
+                    continue;
+                }
+                if (channel.State != ActorChannelState.Open)
+                    continue;
+                ObjectUpdateData full =channel.CaptureOwnerChangeState(now);
+                var change = new OwnerChangeData
+                {
+                    OwnerConnectId = newOwnerConnectionId,
+                    State = FilterForConnection(recipient, actor, full)
+                };
+                QueueReliableBunch(recipient, new NetBunch
+                {
+                    ObjectId = objectId,
+                    Type = NetBunchType.OwnerChanged,
+                    PayloadJson = JsonUtility.ToJson(change)
+                });
+                channel.ForceNetUpdate();
+            }
+            Debug.Log(
+                $"对象 {objectId} 所有者：{previousOwner} → " +
+                $"{newOwnerConnectionId}，归属版本={actor.OwnerVersion}",
+                this);
+            return true;
+        }
+        private void ReleaseDisconnectedObjectOwners()
+        {
+             foreach (NetworkObject actor
+                     in networkObjectRegistry.GetAllObject())
+            {
+                if (actor != null && !actor.IsPlayerObject &&
+                    actor.OwnerConnectId != 0 &&
+                    FindConnectedOwner(actor.OwnerConnectId) == null)
+                {
+                    ServerSetObjectOwner(actor.NetObjectId, 0);
+                }
+            }
+        }
+        private void HandleOwnerChanged(Connection connection,NetBunch bunch)
+        {
+            if(isServer)return;
+            OwnerChangeData data;
+            try
+            {
+                data=JsonUtility.FromJson<OwnerChangeData>(bunch.PayloadJson);
+            }
+            catch
+            {
+                return;
+            }
+            if(connection.ActorChannels.TryGetValue(bunch.ObjectId,out ActorChannel channel))
+            {
+                channel.ReceiveOwnerChange(data);
+            }
+        }
+        [SerializeField] private uint testOwnerObjectId;
+        [SerializeField] private uint testNewOwnerConnectionId;
+
+        [ContextMenu("测试修改普通对象所有者")]
+        private void TestChangeObjectOwner()
+        {
+            if (!Application.isPlaying || !isServer)
+                return;
+            if (!ServerSetObjectOwner(
+                    testOwnerObjectId, testNewOwnerConnectionId))
+            {
+                Debug.LogWarning(
+                    "修改失败：检查对象、连接、玩家对象限制或可靠队列。",
+                    this);
+            }
+        }
+        [ContextMenu("测试通过拥有的对象发送服务器 RPC")]
+        private void TestOwnedObjectRpc()
+        {
+            if (!Application.isPlaying || isServer)
+                return;
+            SendServerRpc(
+                testOwnerObjectId,
+                101,
+                JsonUtility.ToJson(new AttackRpcArgs
+                {
+                    TargetObjectId = testAttackTargetObject
+                }),
+                testAttackTargetObject);
+        }
     }
 
 }

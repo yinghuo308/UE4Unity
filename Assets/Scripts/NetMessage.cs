@@ -17,7 +17,8 @@ namespace UeNet
         DespawnObject=7,
         StateUpdate=8,
         ActorBunch=9,
-        FragmentAck=10
+        FragmentAck=10,
+        ConnectReject=11
     }
     [Serializable]
         public class SpawnData
@@ -26,6 +27,9 @@ namespace UeNet
             public string ObjectType;
             public uint OwnerConnectId;
             public uint StateVersion;
+            public bool HasInventory;
+            public uint OwnerVersion;
+            public bool IsPlayerObject;
             public InventoryStateData Inventory;
             public List<PropertyUpdateData> InitialProperties=new List<PropertyUpdateData>();
         }
@@ -43,6 +47,9 @@ namespace UeNet
         public Vector3 Position;
         public uint TargetObjectId;
         public int PrivateScore;
+        public Quaternion Rotation=Quaternion.identity;
+        public Vector3 Velocity;
+        public double MovementServerTime;
     }
     [Serializable]
     public class DespawnData
@@ -120,7 +127,7 @@ namespace UeNet
                 if (message.Type <
                         (int)NetMessageType.ConnectRequest ||
                     message.Type >
-                        (int)NetMessageType.FragmentAck)
+                        (int)NetMessageType.ConnectReject)
                     return false;
                 type = (NetMessageType)message.Type;
                 connectionId = message.ConnectionId;
@@ -133,6 +140,20 @@ namespace UeNet
                 // 不可靠消息不应该携带 MessageId。
                 if (!reliable && messageId != 0)
                     return false;
+                bool handshake=type==NetMessageType.ConnectRequest||type==
+                    NetMessageType.ConnectAccept||type==NetMessageType.ConnectReject;
+                if(handshake&&reliable)
+                    return false;
+                if ((type == NetMessageType.ConnectRequest ||
+                    type == NetMessageType.ConnectReject) &&connectionId != 0)
+                {
+                    return false;
+                }
+                if (type == NetMessageType.ConnectAccept &&
+                    connectionId == 0)
+                {
+                    return false;
+                }
                 if (type == NetMessageType.FragmentAck &&
                     (reliable || connectionId == 0))
                 {

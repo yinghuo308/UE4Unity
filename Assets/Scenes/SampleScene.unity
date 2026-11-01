@@ -266,6 +266,7 @@ GameObject:
   m_Component:
   - component: {fileID: 155123753}
   - component: {fileID: 155123752}
+  - component: {fileID: 155123754}
   m_Layer: 0
   m_Name: Server
   m_TagString: Untagged
@@ -291,6 +292,18 @@ MonoBehaviour:
   testDespawnObjectId: 1
   testRpcObjectId: 1
   testAttackTargetObject: 2
+  testSubobjectId: 2
+  propertyBytesPerTick: 4096
+  simulateNetwork: 0
+  simulatedLoss: 0.1
+  simulatedDuplicate: 0.02
+  simulatedLatencyMs: 100
+  simulatedJitterMs: 50
+  simulationSeed: 12345
+  prefabRegistry: {fileID: 155123754}
+  playerObjectType: Player
+  testSpawnObjectType: Enemy
+  testSpawnPosition: {x: 3, y: 0, z: 0}
 --- !u!4 &155123753
 Transform:
   m_ObjectHideFlags: 0
@@ -306,6 +319,21 @@ Transform:
   m_Children: []
   m_Father: {fileID: 0}
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
+--- !u!114 &155123754
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 155123751}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: d9bdbb369845f8c46bad446771126875, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  prefabs:
+  - {fileID: 6202318938189081381, guid: fcfdc0449e18d104bb547c596f972428, type: 3}
+  - {fileID: 6812209583677571493, guid: 963ac36cc155aa04f8838d59facd7417, type: 3}
 --- !u!1 &192311520
 GameObject:
   m_ObjectHideFlags: 0
@@ -316,6 +344,7 @@ GameObject:
   m_Component:
   - component: {fileID: 192311522}
   - component: {fileID: 192311521}
+  - component: {fileID: 192311523}
   m_Layer: 0
   m_Name: Client
   m_TagString: Untagged
@@ -341,6 +370,18 @@ MonoBehaviour:
   testDespawnObjectId: 1
   testRpcObjectId: 1
   testAttackTargetObject: 2
+  testSubobjectId: 0
+  propertyBytesPerTick: 4096
+  simulateNetwork: 0
+  simulatedLoss: 0.1
+  simulatedDuplicate: 0.02
+  simulatedLatencyMs: 100
+  simulatedJitterMs: 50
+  simulationSeed: 12345
+  prefabRegistry: {fileID: 192311523}
+  playerObjectType: Player
+  testSpawnObjectType: Enemy
+  testSpawnPosition: {x: 3, y: 0, z: 0}
 --- !u!4 &192311522
 Transform:
   m_ObjectHideFlags: 0
@@ -356,6 +397,21 @@ Transform:
   m_Children: []
   m_Father: {fileID: 0}
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
+--- !u!114 &192311523
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 192311520}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: d9bdbb369845f8c46bad446771126875, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  prefabs:
+  - {fileID: 6202318938189081381, guid: fcfdc0449e18d104bb547c596f972428, type: 3}
+  - {fileID: 6812209583677571493, guid: 963ac36cc155aa04f8838d59facd7417, type: 3}
 --- !u!1 &312801487
 GameObject:
   m_ObjectHideFlags: 0
@@ -366,6 +422,7 @@ GameObject:
   m_Component:
   - component: {fileID: 312801489}
   - component: {fileID: 312801488}
+  - component: {fileID: 312801490}
   m_Layer: 0
   m_Name: Client (1)
   m_TagString: Untagged
@@ -391,6 +448,18 @@ MonoBehaviour:
   testDespawnObjectId: 1
   testRpcObjectId: 2
   testAttackTargetObject: 1
+  testSubobjectId: 0
+  propertyBytesPerTick: 4096
+  simulateNetwork: 0
+  simulatedLoss: 0.1
+  simulatedDuplicate: 0.02
+  simulatedLatencyMs: 100
+  simulatedJitterMs: 50
+  simulationSeed: 12345
+  prefabRegistry: {fileID: 312801490}
+  playerObjectType: Player
+  testSpawnObjectType: Enemy
+  testSpawnPosition: {x: 3, y: 0, z: 0}
 --- !u!4 &312801489
 Transform:
   m_ObjectHideFlags: 0
@@ -406,6 +475,21 @@ Transform:
   m_Children: []
   m_Father: {fileID: 0}
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
+--- !u!114 &312801490
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 312801487}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: d9bdbb369845f8c46bad446771126875, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  prefabs:
+  - {fileID: 6202318938189081381, guid: fcfdc0449e18d104bb547c596f972428, type: 3}
+  - {fileID: 6812209583677571493, guid: 963ac36cc155aa04f8838d59facd7417, type: 3}
 --- !u!1 &330585543
 GameObject:
   m_ObjectHideFlags: 0

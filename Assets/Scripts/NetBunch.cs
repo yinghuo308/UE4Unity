@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using UeNet;
 
 
 public enum NetBunchType
@@ -11,7 +12,8 @@ public enum NetBunchType
     SubobjectProperties=5,
     SubobjectCreate=6,
     SubobjectDestroy=7,
-    SubobjectItemProperties=8
+    SubobjectItemProperties=8,
+    OwnerChanged=9
 }
 public enum RpcDirection
 {
@@ -35,6 +37,7 @@ public class RpcCallData
     public ushort RpcId;
     public RpcDirection Direction;
     public string ArgsJson;
+    public uint OwnerVersion;
     public List<uint>ObjectReferenceIds;
 }
 [Serializable]
@@ -52,4 +55,10 @@ public class HitRpcArgs
 public class AttackRpcArgs
 {
     public uint TargetObjectId;
+}
+[Serializable]
+public sealed class OwnerChangeData
+{
+    public uint OwnerConnectId;
+    public ObjectUpdateData State;
 }

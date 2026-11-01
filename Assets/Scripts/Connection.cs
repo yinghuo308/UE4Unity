@@ -27,6 +27,8 @@ namespace UeNet
         public FragmentReceiveBuffer FragmentReceiver{get;}=new FragmentReceiveBuffer();
         public FragmentSendQueue FragmentSender{get;}=new FragmentSendQueue();
         public bool SendFragmentsFirst{get;set;}=true;
+        public ulong ClientNonce{get;internal set;}
+        public ulong SessionId{get;internal set;}
         public Connection(string remoteAs,double now)
         {
             remoteAddress=remoteAs;

@@ -15,6 +15,7 @@ namespace UeNet
     public class ObjectUpdateData
     {
         public uint ObjectId;
+        public uint OwnerVersion;
         public List<PropertyUpdateData> Properties=new List<PropertyUpdateData>();
     }
 }

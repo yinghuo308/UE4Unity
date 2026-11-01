@@ -1,6 +1,7 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using TMPro;
 using UeNet;
 using UnityEngine;
 public enum ActorChannelState
@@ -33,6 +34,7 @@ public class ActorChannel
     }
     private const float PositionWakeThreshold=0.001f;
     private Vector3 lastObservedPosition;
+    private Quaternion lastObservedRotation;
     private readonly Dictionary<ushort,PropertyUpdateData> pendingProperties =
         new Dictionary<ushort, PropertyUpdateData>();
     public ReliableMessageQueue ReliableSender{get;}=new ReliableMessageQueue();
@@ -45,12 +47,16 @@ public class ActorChannel
     public bool Isdormant=>dormant;
     public bool HasForcedUpdate=>forceNetUpdate;
     private double lastActivityTime;
+    private Vector3 lastObservedVelocity;
+    private uint recipientConnectionId;
+    private uint pendingOwnerVersion;
+    private bool hasPendingOwnerVersion;
     public ActorChannel(uint objectId)
     {
         ObjectId = objectId;
         State = ActorChannelState.Opening;
     }
-    public void Bind(NetworkObject target)
+    public void Bind(NetworkObject target,uint recipientConnectionId=0)
     {
         if (target == null ||
             target.NetObjectId != ObjectId)
@@ -58,7 +64,10 @@ public class ActorChannel
             return;
         }
         Target = target;
+        this.recipientConnectionId=recipientConnectionId;
         lastObservedPosition=target.transform.position;
+        lastObservedRotation=target.transform.rotation;
+        lastObservedVelocity=target.Velocity;
         replicator = new ObjectReplicator(target);
         if (target.IsServerObject)
         {
@@ -79,40 +88,41 @@ public class ActorChannel
         {
             inventoryReplicators.Add(target.Inventory.SubobjectId,new InventoryReplicator(target.Inventory));
         }
-        if(pendingProperties.Count==0)return;
-        var update=new ObjectUpdateData
-        {
-            ObjectId=ObjectId
-        };
-        foreach(PropertyUpdateData property in pendingProperties.Values)
-        {
-            update.Properties.Add(property);
-        }
-        pendingProperties.Clear();
-        replicator.ApplyUpdate(update);
+        FlushPendingProperties();
     }
     public void ReceiveProperties(ObjectUpdateData update)
     {
-        if (update == null || update.ObjectId != ObjectId)
-        return;
-        if (State == ActorChannelState.Closing ||
+        if (update == null || update.ObjectId != ObjectId||
+            update.Properties == null ||
+            State == ActorChannelState.Closing ||
             State == ActorChannelState.Closed)
+        return;
+        if (State == ActorChannelState.Open && Target != null)
+        {
+            if(update.OwnerVersion<Target.OwnerVersion)return;
+            if (update.OwnerVersion == Target.OwnerVersion)
+            {
+                ApplyCurrentProperties(update);
+                return;
+            }
+        }
+        if (hasPendingOwnerVersion &&
+            update.OwnerVersion < pendingOwnerVersion)
         {
             return;
         }
-        if (State == ActorChannelState.Open && replicator != null)
+        if (!hasPendingOwnerVersion ||
+            update.OwnerVersion > pendingOwnerVersion)
         {
-            replicator.ApplyUpdate(update);
-            return;
+            pendingProperties.Clear();
+            pendingOwnerVersion = update.OwnerVersion;
+            hasPendingOwnerVersion = true;
         }
         foreach(PropertyUpdateData item in update.Properties)
         {
             if(item==null||!RepLayout.Instance.TryGetProperty(item.PropertyId,
-                                    out RepProperty property))
-            {
-                continue;
-            }
-            if(!property.TryReadUpdate(item,new ObjectStateData()))
+                            out RepProperty property)
+                            ||!property.TryReadUpdate(item,new ObjectStateData()))
             {
                 continue;
             }
@@ -139,6 +149,7 @@ public class ActorChannel
         State = ActorChannelState.Closed;
         Target = null;
         replicator = null;
+        hasPendingOwnerVersion=false;
         pendingProperties.Clear();
         pendingRpcs.Clear();
         inventoryReplicators.Clear();
@@ -160,6 +171,7 @@ public class ActorChannel
         State=ActorChannelState.Closing;
         Target=null;
         replicator=null;
+        hasPendingOwnerVersion=false;
         pendingProperties.Clear();
         pendingRpcs.Clear();
         inventoryReplicators.Clear();
@@ -564,8 +576,8 @@ public class ActorChannel
         if(State!=ActorChannelState.Open||Target==null||!Target.IsServerObject)return;
         Vector3 currentPosition = Target.transform.position;
         float distanceSquared =(currentPosition - lastObservedPosition).sqrMagnitude;
-         if (distanceSquared <=
-        PositionWakeThreshold * PositionWakeThreshold)
+         if (PositionQuantization.SamePosition(currentPosition,
+            lastObservedPosition))
         {
             return;
         }
@@ -573,5 +585,127 @@ public class ActorChannel
         // 唤醒通道，并重新计算空闲时间。
         MarkActivity(now);
     }
-
+    public void CheckRotationAndWake(double now)
+    {
+        if (State != ActorChannelState.Open ||
+            Target == null ||!Target.IsServerObject)
+        {
+            return;
+        }
+        Quaternion currentRotation = Target.transform.rotation;
+        if (RotationUtility.SameRotation(
+                currentRotation,lastObservedRotation))
+        {
+            return;
+        }
+        lastObservedRotation = currentRotation;
+        MarkActivity(now);
+    }
+    public void CheckVelocityAndWake(double now)
+    {
+        if (State != ActorChannelState.Open ||
+            Target == null ||!Target.IsServerObject)
+        {
+            return;
+        }
+        Vector3 currentVelocity = Target.Velocity;
+        if (VelocityUtility.SameVelocity(currentVelocity,
+                lastObservedVelocity))
+        {
+            return;
+        }
+        lastObservedVelocity = currentVelocity;
+        MarkActivity(now);
+    }
+    private void ApplyCurrentProperties(ObjectUpdateData update)
+    {
+        var allowed = new ObjectUpdateData
+        {
+            ObjectId = ObjectId,
+            OwnerVersion = update.OwnerVersion
+        };
+        foreach (PropertyUpdateData item in update.Properties)
+        {
+            if (item != null &&
+                RepLayout.Instance.TryGetProperty(
+                    item.PropertyId, out RepProperty property) &&
+                property.ShouldSendTo(
+                    Target.OwnerConnectId, recipientConnectionId))
+            {
+                allowed.Properties.Add(item);
+            }
+        }
+        replicator.ApplyUpdate(allowed);
+    }
+    private void FlushPendingProperties()
+    {
+        if (!hasPendingOwnerVersion || Target == null ||
+            pendingOwnerVersion > Target.OwnerVersion)
+        {
+            return;
+        }
+        var update = new ObjectUpdateData
+        {
+            ObjectId = ObjectId,
+            OwnerVersion = pendingOwnerVersion
+        };
+        update.Properties.AddRange(pendingProperties.Values);
+        pendingProperties.Clear();
+        hasPendingOwnerVersion=false;
+        if (update.OwnerVersion == Target.OwnerVersion)
+            ApplyCurrentProperties(update);
+    }
+    public bool ReceiveOwnerChange(OwnerChangeData data)
+    {
+        if (State != ActorChannelState.Open ||
+            Target == null || Target.IsServerObject ||
+            Target.IsPlayerObject ||
+            data == null || data.State == null ||
+            data.State.ObjectId != ObjectId ||
+            data.State.OwnerVersion <= Target.OwnerVersion ||
+            data.State.Properties == null)
+        {
+            return false;
+        }
+        var seen=new HashSet<ushort>();
+        foreach (PropertyUpdateData item in data.State.Properties)
+        {
+            if (item == null || !seen.Add(item.PropertyId) ||
+                !RepLayout.Instance.TryGetProperty(
+                    item.PropertyId, out RepProperty property) ||
+                !property.ShouldSendTo(
+                    data.OwnerConnectId, recipientConnectionId) ||
+                !property.TryReadUpdate(item, new ObjectStateData()))
+            {
+                return false;
+            }
+        }
+        foreach (RepProperty property in RepLayout.Instance.Properties)
+        {
+            if (property.ShouldSendTo(
+                    data.OwnerConnectId, recipientConnectionId) &&
+                !seen.Contains(property.PropertyId))
+            {
+                return false;
+            }
+        }
+        Target.OwnerConnectId=data.OwnerConnectId;
+        Target.OwnerVersion=data.State.OwnerVersion;
+        if (Target.OwnerConnectId != recipientConnectionId)
+            Target.PrivateScore = 0;
+        ApplyCurrentProperties(data.State);
+        FlushPendingProperties();
+        return true;
+    }
+    public ObjectUpdateData CaptureOwnerChangeState(double now)
+    {
+        if(State!=ActorChannelState.Open||Target==null||
+            !Target.IsServerObject || replicator == null)
+        {
+            throw new InvalidOperationException("对象通道尚未打开。");
+        }        
+        replicator.TryCaptureUpdate(now,out ObjectUpdateData update,
+                    allowPeriodicRefresh:false,forceFullRefresh:true);
+        return update;
+    }
 }

@@ -26,11 +26,13 @@ namespace UeNet
         // 包括对方等待发出 ACK 的时间，不等于纯网络延迟。
         public double LastAckDelaySeconds { get; private set; }
         // 生成待发送的包，带上本端的接收记录。
-        public NetPacket CreatePacket(byte[]payload)
+        public NetPacket CreatePacket(byte[]payload,ulong sessionId)
         {
             uint sequence=nextSendSequence;
             nextSendSequence=unchecked(nextSendSequence+1);
-            return new NetPacket(sequence,hasReceivedPacket,latestReceivedSequence,receivedMask,payload);
+            return new NetPacket(sequence,hasReceivedPacket,
+                                latestReceivedSequence,receivedMask,
+                                sessionId,payload);
         }
         public void RecordSent(uint sequence,double now)
         {
